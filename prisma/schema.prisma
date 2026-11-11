@@ -1,0 +1,172 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// Добавь эту модель
+model FriendRequest {
+  id         String        @id @default(uuid())
+  senderId   String
+  receiverId String
+  status     RequestStatus @default(PENDING)
+  createdAt  DateTime      @default(now())
+
+  sender   User @relation("SentRequests", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver User @relation("ReceivedRequests", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  @@unique([senderId, receiverId]) // Запрещаем дубликаты заявок
+}
+
+// Добавь этот enum
+enum RequestStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+}
+
+// 1. ПОЛЬЗОВАТЕЛИ
+model User {
+  id            String   @id @default(uuid())
+  username      String   @unique
+  email         String   @unique
+  phone         String?  @unique
+  passwordHash  String
+  displayName   String?
+  avatarUrl     String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  status        UserStatus @default(ACTIVE)
+
+  cryptoKeys    CryptoKeys?
+  contacts      Contact[]      @relation("UserContacts")
+  contactedBy   Contact[]      @relation("UserContactedBy")
+  devices       Device[]
+  chatMembers   UserChat[]
+  verificationCodes VerificationCode[]
+  sentRequests     FriendRequest[] @relation("SentRequests")
+  receivedRequests FriendRequest[] @relation("ReceivedRequests")
+
+  @@index([username])
+  @@index([email])
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+// 2. КРИПТОГРАФИЧЕСКИЕ КЛЮЧИ (Signal Protocol)
+model CryptoKeys {
+  userId             String   @id
+  identityKey        String   // Base64: публичный Identity Key
+  signedPreKeyId     Int
+  signedPreKeyPublic String   // Base64
+  signedPreKeySig    String   // Base64: подпись Signed PreKey
+  registrationId     Int? 
+  lastBundleUpdate   DateTime @default(now())
+  
+  oneTimePreKeys     OneTimePreKey[]
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model OneTimePreKey {
+  id        String @id @default(uuid())
+  userId    String
+  keyId     Int    // Уникальный ID ключа в наборе
+  publicKey String // Base64
+
+  cryptoKeys CryptoKeys @relation(fields: [userId], references: [userId], onDelete: Cascade)
+
+  @@unique([userId, keyId])
+}
+
+// 3. КОНТАКТЫ
+model Contact {
+  userId        String
+  contactUserId String
+  addedAt       DateTime @default(now())
+  isBlocked     Boolean  @default(false)
+
+  user    User @relation("UserContacts", fields: [userId], references: [id], onDelete: Cascade)
+  contact User @relation("UserContactedBy", fields: [contactUserId], references: [id], onDelete: Cascade)
+
+  @@id([userId, contactUserId])
+}
+
+// 4. УСТРОЙСТВА И PUSH-ТОКЕНЫ
+model Device {
+  id        String   @id @default(uuid())
+  userId    String
+  deviceId  String   // Генерируется клиентом
+  pushToken String?  // FCM (Android) или APNs (iOS)
+  isActive  Boolean  @default(true)
+  lastSeen  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, deviceId])
+  @@index([userId])
+}
+
+// 5. МЕТАДАННЫЕ ЧАТОВ (БЕЗ СОДЕРЖИМОГО СООБЩЕНИЙ)
+model Chat {
+  id        String   @id @default(uuid())
+  type      ChatType @default(DIRECT)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members UserChat[]
+}
+
+enum ChatType {
+  DIRECT
+  GROUP
+}
+
+model UserChat {
+  userId       String
+  chatId       String
+  joinedAt     DateTime  @default(now())
+  lastReadAt   DateTime?
+  unreadCount  Int       @default(0)
+  lastActivity DateTime? // Для сортировки списка чатов
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  chat Chat @relation(fields: [chatId], references: [id], onDelete: Cascade)
+
+  @@id([userId, chatId])
+  @@index([userId, lastActivity(sort: Desc)])
+}
+
+// 6. ВРЕМЕННЫЕ КОДЫ ВЕРИФИКАЦИИ
+model VerificationCode {
+  id        String   @id @default(uuid())
+  userId    String?  // Null если код отправлен до создания аккаунта
+  email     String?
+  phone     String?
+  code      String
+  type      VerificationType
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([email, type])
+  @@index([phone, type])
+  @@index([expiresAt])
+}
+
+enum VerificationType {
+  EMAIL_REGISTER
+  EMAIL_LOGIN
+  PHONE_VERIFY
+}

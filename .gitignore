@@ -1,0 +1,10 @@
+# .gitignore
+node_modules/
+dist/
+.env
+*.log
+prisma/migrations/*/migration.sql
+.DS_Store
+firebase-service-account.json
+apk/
+uploads/

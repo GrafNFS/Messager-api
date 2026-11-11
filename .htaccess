@@ -1,0 +1,12 @@
+<IfModule mod_deflate.c>
+    # Отключаем сжатие для всех запросов к /api/media
+    SetEnvIf Request_URI ^/api/media/ no-gzip dont-vary
+    
+    # ИЛИ отключаем сжатие конкретно для .enc файлов
+    SetEnvIfNoCase Request_URI \.enc$ no-gzip dont-vary
+</IfModule>
+
+# Также убедимся, что Apache не буферизирует ответы неправильно
+<IfModule mod_headers.c>
+    Header set Cache-Control "no-transform"
+</IfModule>
