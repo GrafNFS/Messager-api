@@ -9,7 +9,8 @@ export const sendSilentMessagePush = async (
   userId: string,
   from: string,
   messageId: string,
-  payload: any
+  payload: any,
+  typeMsg: string
 ) => {
   try {
     // Находим все активные устройства получателя пуша
@@ -20,12 +21,16 @@ export const sendSilentMessagePush = async (
         pushToken: { not: null }
       }
     });
+    var encryptedPayload = ""
 
     if (devices.length === 0) {
       console.log(`[FCM] ⚠️ Нет активных устройств для пуша пользователю ${userId}`);
       return;
     }
 
+    if (typeMsg == "text") {
+      encryptedPayload = JSON.stringify(payload)
+    }
     // Собираем "тихий" Data-пакет
     const message = {
       data: {
@@ -33,7 +38,8 @@ export const sendSilentMessagePush = async (
         messageId: messageId,
         timestamp: Date.now().toString(),
         // Сериализуем зашифрованный payload сокета в строку для Android клиентов
-        encryptedPayload: JSON.stringify(payload) 
+        encryptedPayload: encryptedPayload,
+        typeMsg: typeMsg
       },
       tokens: devices.map(d => d.pushToken!)
     };

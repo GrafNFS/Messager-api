@@ -3,6 +3,7 @@ import http from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
 import helmet from 'helmet';
+import jwt from 'jsonwebtoken';
 import { authenticate } from './middleware/auth';
 
 // Существующие контроллеры
@@ -22,6 +23,11 @@ const offlineMessages = new Map<string, Array<{
   timestamp: number;
   delivered: boolean;
 }>>();
+
+ // ✅ ИСПРАВЛЕНИЕ: Выносим хранилища сокетов на уровень модуля, 
+  // чтобы роут /api/users/:userId/status мог к ним обращаться
+  const userSockets = new Map<string, string>();
+  const socketUsers = new Map<string, string>();
 
 const readReceipts = new Map<string, { readBy: string[]; timestamp: number }>();
 
@@ -77,9 +83,7 @@ export const startServer = (port: number) => {
   // Middleware
   app.use(helmet());
   app.use(cors({ origin: '*' }));
-  // app.use(compression()); 
-
-  app.use(express.json({ limit: '50mb' })); // ⚠️ Важно: для загрузки файлов через multipart этот лимит не влияет, он только для JSON
+  app.use(express.json({ limit: '50mb' }));
 
   // === API ROUTES ===
   app.get('/api/health', (req, res) => {
@@ -90,14 +94,14 @@ export const startServer = (port: number) => {
   app.post('/api/login', login);
 
   app.get('/api/users/search', searchUsers);
-  app.get('/myprofile', authenticate, getMyProfile);
-  app.put('/myprofile', authenticate, updateMyProfile);
+  app.get('/api/myprofile', authenticate, getMyProfile);
+  app.put('/api/myprofile', authenticate, updateMyProfile);
   app.post('/api/contacts', addContact);
   app.get('/api/contacts', getMyContacts);
 
   app.post('/api/friend-requests', sendFriendRequest);
   app.get('/api/friend-requests/pending', getPendingRequests);
-  app.get('/api/frends-requests/count', getPendingCountRequests)
+  app.get('/api/friends-requests/count', getPendingCountRequests)
   app.post('/api/friend-requests/respond', respondToFriendRequest);
 
   app.post('/api/keys/upload', uploadKeys);
@@ -188,9 +192,6 @@ export const startServer = (port: number) => {
 
   app.get('/api/users/:userId/status', (req, res) => {
     const { userId } = req.params;
-    // ⚠️ Внимание: userSockets объявлен ниже, внутри io.on. 
-    // Лучше вынести userSockets на уровень модуля (как offlineMessages), чтобы этот роут работал.
-    // Я исправлю это в коде ниже 👇
     const isOnline = userSockets.has(userId);
     res.json({ userId, isOnline });
   });
@@ -198,16 +199,22 @@ export const startServer = (port: number) => {
   // === SOCKET.IO ===
   const io = new Server(server, { cors: { origin: '*' } });
 
-  // ✅ ИСПРАВЛЕНИЕ: Выносим хранилища сокетов на уровень модуля, 
-  // чтобы роут /api/users/:userId/status мог к ним обращаться
-  const userSockets = new Map<string, string>();
-  const socketUsers = new Map<string, string>();
-
   io.on('connection', (socket) => {
     console.log(`🔗 Client connected: ${socket.id}`);
 
-    socket.on('join_room', (data) => {
-      const { userId } = data;
+    io.use((socket, next) => {
+      const token = socket.handshake.auth.token;
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET!);
+        socket.data.userId = decoded.id;
+        next();
+      } catch {
+        next(new Error('unauthorized'));
+      }
+    });
+
+    socket.on('join_room', () => {
+      const userId = socket.data.userId;
       userSockets.set(userId, socket.id);
       socketUsers.set(socket.id, userId);
       console.log(`👤 User ${userId} joined with socket ${socket.id}`);
@@ -223,7 +230,7 @@ export const startServer = (port: number) => {
     });
 
     socket.on('private_message', (data) => {
-      const { to, payload, messageId } = data;
+      const { to, payload, messageId, typeMsg } = data;
       const from = socketUsers.get(socket.id);
 
       if (!from) return;
@@ -239,7 +246,7 @@ export const startServer = (port: number) => {
           messageId,
           timestamp: Date.now()
         });
-
+        
         saveMessageToHistory(chatKey, {
           id: messageId,
           senderId: from,
@@ -261,7 +268,7 @@ export const startServer = (port: number) => {
 
         // 🌟 ИСПРАВЛЕНИЕ: Вызываем наш новый метод пуша из контроллера Prisma!
         // Firebase разбудит Android, сервис MyFirebaseMessagingService расшифрует payload и запишет в Room
-        sendSilentMessagePush(to, from, messageId, payload);
+        sendSilentMessagePush(to, from, messageId, payload, typeMsg);
       }
     });
 

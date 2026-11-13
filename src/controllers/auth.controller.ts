@@ -32,7 +32,7 @@ export const register = async (req: Request, res: Response) => {
       }
     });
 
-    // 4. Создаем запись крипто-ключей (пока пустую, заполним позже)
+    // 4. Создаем запись крипто-ключей
     await prisma.cryptoKeys.create({
   data: {
     userId: user.id,

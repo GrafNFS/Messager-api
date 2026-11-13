@@ -17,12 +17,9 @@ export const authenticate = (req: AuthRequest, res: Response, next: NextFunction
     const token = authHeader.split(' ')[1];
     const secret = process.env.JWT_SECRET || 'your-super-secret-key'; // В продакшене используй .env!
 
-    console.log(`[KEY] ⚠️ ${token} and ${secret}`);
-
     try {
         // Расшифровываем токен
         const decoded = jwt.verify(token, secret) as { id: string };
-        console.log(`[KEY] ⚠️ ${token} and ${secret}`);
         req.user = { id: decoded.id }; // Сохраняем ID пользователя в запрос
         next(); // Передаём управление дальше
     } catch (error) {
