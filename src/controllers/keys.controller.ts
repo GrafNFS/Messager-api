@@ -123,3 +123,21 @@ export const getRemainingPreKeys = async (req: AuthRequest, res: Response) => {
     res.status(500).json({ error: 'Failed to count keys' });
   }
 };
+
+export const uploadOneTimeKeys = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { oneTimeKeys } = req.body;
+    if (!Array.isArray(oneTimeKeys) || oneTimeKeys.length === 0) {
+      return res.status(400).json({ error: 'oneTimeKeys is required' });
+    }
+    await prisma.oneTimePreKey.createMany({
+      data: oneTimeKeys.map((k: any) => ({ userId, keyId: k.keyId, publicKey: k.publicKey })),
+      skipDuplicates: true
+    });
+    const remaining = await prisma.oneTimePreKey.count({ where: { userId } });
+    res.json({ success: true, remaining });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to upload one-time keys' });
+  }
+};
