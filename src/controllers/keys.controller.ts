@@ -1,109 +1,125 @@
-import { Request, Response } from 'express';
+import { Response } from 'express';
 import { PrismaClient } from '@prisma/client';
+import { AuthRequest } from '../middleware/auth';
 
 const prisma = new PrismaClient();
 
-// 1. Загрузка ключей на сервер (выполняется клиентом после логина)
-export const uploadKeys = async (req: Request, res: Response) => {
+// 1. Загрузка/пополнение ключей (вызывается клиентом после регистрации и при ротации)
+export const uploadKeys = async (req: AuthRequest, res: Response) => {
   try {
-    const { 
-      userId, 
-      identityKey, 
-      signedPreKeyId, 
-      signedPreKeyPublic, 
-      signedPreKeySig, 
-      oneTimeKeys, // ✅ Массив ключей
-      registrationId 
+    // userId БЕРЁМ ИЗ ТОКЕНА — клиентский userId из тела игнорируем.
+    // Иначе любой мог бы перезаписать чужие ключи = полный MITM.
+    const userId = req.user!.id;
+    const {
+      identityKey,
+      signedPreKeyId,
+      signedPreKeyPublic,
+      signedPreKeySig,
+      oneTimeKeys,
+      registrationId
     } = req.body;
 
-    if (!userId || !identityKey) {
-      return res.status(400).json({ error: "Missing required fields" });
+    if (!identityKey || !signedPreKeyPublic || !signedPreKeySig) {
+      return res.status(400).json({ error: 'Missing required key fields' });
+    }
+    if (!registrationId || typeof registrationId !== 'number') {
+      // Не генерируем случайный registrationId на сервере —
+      // он обязан совпадать с клиентским SignalProtocolStore.
+      return res.status(400).json({ error: 'registrationId is required' });
     }
 
-    // 1. Обновляем/создаём основные ключи
     await prisma.cryptoKeys.upsert({
       where: { userId },
       update: {
         identityKey,
-        signedPreKeyId,
+        signedPreKeyId: signedPreKeyId ?? 0,
         signedPreKeyPublic,
         signedPreKeySig,
-        registrationId: registrationId || Math.floor(Math.random() * 16380) + 1,
+        registrationId,
         lastBundleUpdate: new Date()
       },
       create: {
         userId,
         identityKey,
-        signedPreKeyId,
+        signedPreKeyId: signedPreKeyId ?? 0,
         signedPreKeyPublic,
         signedPreKeySig,
-        registrationId: registrationId || Math.floor(Math.random() * 16380) + 1,
+        registrationId,
         lastBundleUpdate: new Date()
       }
     });
 
-    // ✅ 2. СОХРАНЯЕМ One-Time PreKeys (самое важное!)
-    if (oneTimeKeys && Array.isArray(oneTimeKeys) && oneTimeKeys.length > 0) {
-      // Сначала удаляем старые ключи этого пользователя (опционально, чтобы не дублировать)
-      await prisma.oneTimePreKey.deleteMany({ where: { userId } });
-
-      // Создаём новые
-      const keysToCreate = oneTimeKeys.map((key: any) => ({
-        userId,
-        keyId: key.keyId,
-        publicKey: key.publicKey
-      }));
-
+    // Пополняем запас ОДНОРАЗОВЫХ ключей.
+    // ВАЖНО: старые ключи НЕ удаляем — этот endpoint теперь и есть механизм ротации.
+    if (Array.isArray(oneTimeKeys) && oneTimeKeys.length > 0) {
       await prisma.oneTimePreKey.createMany({
-        data: keysToCreate,
-        skipDuplicates: true // На случай если ключи уже есть
+        data: oneTimeKeys.map((k: any) => ({
+          userId,
+          keyId: k.keyId,
+          publicKey: k.publicKey
+        })),
+        skipDuplicates: true
       });
-      
-      console.log(`✅ Saved ${keysToCreate.length} One-Time PreKeys for ${userId}`);
     }
 
-    res.json({ success: true, message: "Keys uploaded successfully" });
-    
+    const remaining = await prisma.oneTimePreKey.count({ where: { userId } });
+    res.json({ success: true, remaining });
   } catch (error) {
-    console.error("❌ Upload keys error:", error);
-    res.status(500).json({ error: "Failed to upload keys" });
+    console.error('Upload keys error:', error);
+    res.status(500).json({ error: 'Failed to upload keys' });
   }
 };
 
-// 2. Получение "пакета" ключей другого пользователя (для начала чата)
-export const getKeysBundle = async (req: Request, res: Response) => {
+// 2. Prekey bundle другого пользователя.
+// Публичные ключи — публичны, но отдаём РОВНО ОДИН one-time prekey
+// и сразу удаляем его транзакцией (он одноразовый).
+export const getKeysBundle = async (req: AuthRequest, res: Response) => {
   try {
-    const { userId } = req.params;
+    const userId = req.params.userId as string;
 
-    // ✅ Обязательно указываем include, иначе oneTimePreKeys будут пустыми!
     const keys = await prisma.cryptoKeys.findUnique({
       where: { userId },
-      include: {
-        oneTimePreKeys: true 
-      }
+      include: { oneTimePreKeys: { orderBy: { keyId: 'asc' }, take: 1 } }
     });
 
-    if (!keys) {
-      return res.status(404).json({ error: "Keys not found for this user" });
+    // Ключи ещё не загружены (или 'pending'-заглушка) — не отдаём мусор
+    if (!keys || keys.identityKey === 'pending' || !keys.signedPreKeyPublic) {
+      return res.status(404).json({ error: 'Keys not found for this user' });
     }
 
-    // ✅ Формируем ответ в точности как ожидает Android
-    const bundle = {
+    // Атомарно забираем один OTK
+    let givenKey: { keyId: number; publicKey: string } | null = null;
+    const candidate = keys.oneTimePreKeys[0];
+    if (candidate) {
+      const deleted = await prisma.oneTimePreKey.deleteMany({
+        where: { id: candidate.id, userId } // deleteMany как атомарный DELETE по id
+      });
+      if (deleted.count === 1) {
+        givenKey = { keyId: candidate.keyId, publicKey: candidate.publicKey };
+      }
+    }
+
+    res.json({
       identityKey: keys.identityKey,
       signedPreKeyId: keys.signedPreKeyId,
       signedPreKeyPublic: keys.signedPreKeyPublic,
       signedPreKeySig: keys.signedPreKeySig,
-      registrationId: keys.registrationId || 1,
-      oneTimeKeys: keys.oneTimePreKeys.map(k => ({
-        keyId: k.keyId,
-        publicKey: k.publicKey
-      }))
-    };
-
-    console.log(`📤 Sending keys bundle for ${userId}`);
-    res.json(bundle);
+      registrationId: keys.registrationId ?? 1,
+      // 0 или 1 ключ — клиент libsignal умеет работать и без OTK (X3DH со signed prekey)
+      oneTimeKeys: givenKey ? [givenKey] : []
+    });
   } catch (error) {
-    console.error("❌ Fetch keys error:", error);
-    res.status(500).json({ error: "Failed to fetch keys" });
+    console.error('Fetch keys error:', error);
+    res.status(500).json({ error: 'Failed to fetch keys' });
+  }
+};
+
+// 3. Сколько one-time prekeys осталось на сервере (для ротации на клиенте)
+export const getRemainingPreKeys = async (req: AuthRequest, res: Response) => {
+  try {
+    const count = await prisma.oneTimePreKey.count({ where: { userId: req.user!.id } });
+    res.json({ remaining: count });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to count keys' });
   }
 };

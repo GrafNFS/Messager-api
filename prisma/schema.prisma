@@ -1,6 +1,3 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
   provider = "prisma-client-js"
 }
@@ -10,7 +7,6 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Добавь эту модель
 model FriendRequest {
   id         String        @id @default(uuid())
   senderId   String
@@ -21,10 +17,9 @@ model FriendRequest {
   sender   User @relation("SentRequests", fields: [senderId], references: [id], onDelete: Cascade)
   receiver User @relation("ReceivedRequests", fields: [receiverId], references: [id], onDelete: Cascade)
 
-  @@unique([senderId, receiverId]) // Запрещаем дубликаты заявок
+  @@unique([senderId, receiverId])
 }
 
-// Добавь этот enum
 enum RequestStatus {
   PENDING
   ACCEPTED
@@ -63,16 +58,16 @@ enum UserStatus {
   DELETED
 }
 
-// 2. КРИПТОГРАФИЧЕСКИЕ КЛЮЧИ (Signal Protocol)
+// 2. КРИПТОГРАФИЧЕСКИЕ КЛЮЧИ (Signal Protocol) — только ПУБЛИЧНЫЕ ключи
 model CryptoKeys {
   userId             String   @id
   identityKey        String   // Base64: публичный Identity Key
   signedPreKeyId     Int
   signedPreKeyPublic String   // Base64
   signedPreKeySig    String   // Base64: подпись Signed PreKey
-  registrationId     Int? 
+  registrationId     Int?
   lastBundleUpdate   DateTime @default(now())
-  
+
   oneTimePreKeys     OneTimePreKey[]
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -81,7 +76,7 @@ model CryptoKeys {
 model OneTimePreKey {
   id        String @id @default(uuid())
   userId    String
-  keyId     Int    // Уникальный ID ключа в наборе
+  keyId     Int
   publicKey String // Base64
 
   cryptoKeys CryptoKeys @relation(fields: [userId], references: [userId], onDelete: Cascade)
@@ -106,8 +101,8 @@ model Contact {
 model Device {
   id        String   @id @default(uuid())
   userId    String
-  deviceId  String   // Генерируется клиентом
-  pushToken String?  // FCM (Android) или APNs (iOS)
+  deviceId  String
+  pushToken String?
   isActive  Boolean  @default(true)
   lastSeen  DateTime @default(now())
 
@@ -117,7 +112,7 @@ model Device {
   @@index([userId])
 }
 
-// 5. МЕТАДАННЫЕ ЧАТОВ (БЕЗ СОДЕРЖИМОГО СООБЩЕНИЙ)
+// 5. МЕТАДАННЫЕ ЧАТОВ
 model Chat {
   id        String   @id @default(uuid())
   type      ChatType @default(DIRECT)
@@ -138,7 +133,7 @@ model UserChat {
   joinedAt     DateTime  @default(now())
   lastReadAt   DateTime?
   unreadCount  Int       @default(0)
-  lastActivity DateTime? // Для сортировки списка чатов
+  lastActivity DateTime?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
   chat Chat @relation(fields: [chatId], references: [id], onDelete: Cascade)
@@ -150,7 +145,7 @@ model UserChat {
 // 6. ВРЕМЕННЫЕ КОДЫ ВЕРИФИКАЦИИ
 model VerificationCode {
   id        String   @id @default(uuid())
-  userId    String?  // Null если код отправлен до создания аккаунта
+  userId    String?
   email     String?
   phone     String?
   code      String
@@ -169,4 +164,20 @@ enum VerificationType {
   EMAIL_REGISTER
   EMAIL_LOGIN
   PHONE_VERIFY
+}
+
+// 7. СООБЩЕНИЯ — персистентность вместо in-memory Map.
+// payload — JSON с зашифрованным клиентом шифртекстом (E2E): { type, data }
+model Message {
+  id          String    @id              // messageId от клиента (UUID)
+  chatKey     String                      // "userA:userB" (отсортированная пара)
+  senderId    String
+  payload     Json
+  typeMsg     String?
+  timestamp   DateTime
+  deliveredAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([chatKey, timestamp])
+  @@index([chatKey, deliveredAt])
 }

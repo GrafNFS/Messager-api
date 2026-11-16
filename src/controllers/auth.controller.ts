@@ -9,42 +9,35 @@ export const register = async (req: Request, res: Response) => {
   try {
     const { username, email, password, firstName, lastName } = req.body;
 
-    // 1. Проверяем, нет ли уже такого пользователя
+    // Базовая валидация
+    if (!username || !email || !password) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+    if (typeof password !== 'string' || password.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
     const existingUser = await prisma.user.findFirst({
       where: { OR: [{ email }, { username }] }
     });
-
     if (existingUser) {
       return res.status(400).json({ error: 'User already exists' });
     }
 
-    // 2. Хешируем пароль
     const passwordHash = await hashPassword(password);
 
-    // 3. Создаем пользователя в БД
-    // Примечание: Поля phone, avatarUrl опциональны, поэтому их нет в запросе
     const user = await prisma.user.create({
       data: {
         username,
         email,
         passwordHash,
-        displayName: `${firstName} ${lastName}`.trim()
+        displayName: `${firstName ?? ''} ${lastName ?? ''}`.trim() || username
       }
     });
 
-    // 4. Создаем запись крипто-ключей
-    await prisma.cryptoKeys.create({
-  data: {
-    userId: user.id,
-    identityKey: 'pending', // Заглушка
-    signedPreKeyId: 0,
-    signedPreKeyPublic: '',
-    signedPreKeySig: '',
-    registrationId: Math.floor(Math.random() * 16380) + 1, // ✅ Случайный registrationId (1..16383)
-  },
-});
+    // Запись CryptoKeys НЕ создаём с заглушкой "pending" —
+    // getKeysBundle теперь возвращает 404, пока клиент реально не загрузил ключи.
 
-    // 5. Генерируем токен
     const token = generateToken(user.id);
 
     res.status(201).json({
@@ -52,7 +45,6 @@ export const register = async (req: Request, res: Response) => {
       token,
       user: { id: user.id, username: user.username, email: user.email }
     });
-
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Internal server error' });
@@ -62,23 +54,22 @@ export const register = async (req: Request, res: Response) => {
 export const login = async (req: Request, res: Response) => {
   try {
     const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Missing credentials' });
+    }
 
-    // 1. Ищем пользователя (по email или username)
     const user = await prisma.user.findFirst({
       where: { OR: [{ email: username }, { username }] }
     });
-
     if (!user) {
-      return res.status(400).json({ error: 'Invalid credentials' });
+      return res.status(400).json({ error: 'Invalid credentials username' });
     }
 
-    // 2. Сравниваем пароли
     const isMatch = await comparePassword(password, user.passwordHash);
     if (!isMatch) {
       return res.status(400).json({ error: 'Invalid credentials' });
     }
 
-    // 3. Генерируем токен
     const token = generateToken(user.id);
 
     res.json({
@@ -86,7 +77,6 @@ export const login = async (req: Request, res: Response) => {
       token,
       user: { id: user.id, username: user.username, email: user.email }
     });
-
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Internal server error' });

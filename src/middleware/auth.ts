@@ -6,23 +6,29 @@ export interface AuthRequest extends Request {
     user?: { id: string };
 }
 
+export function getJwtSecret(): string {
+    const secret = process.env.JWT_SECRET;
+    if (!secret) {
+        // Не стартуем с дефолтным секретом — это дыра. Падаем сразу.
+        throw new Error('JWT_SECRET is not set in environment');
+    }
+    return secret;
+}
+
 export const authenticate = (req: AuthRequest, res: Response, next: NextFunction) => {
     const authHeader = req.headers.authorization;
 
-    // Проверяем наличие заголовка и формат "Bearer <token>"
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({ error: 'Unauthorized: No token provided' });
     }
 
     const token = authHeader.split(' ')[1];
-    const secret = process.env.JWT_SECRET || 'your-super-secret-key'; // В продакшене используй .env!
 
     try {
-        // Расшифровываем токен
-        const decoded = jwt.verify(token, secret) as { id: string };
-        req.user = { id: decoded.id }; // Сохраняем ID пользователя в запрос
-        next(); // Передаём управление дальше
-    } catch (error) {
-        return res.status(403).json({ error: 'Unauthorized: Invalid or expired token' });
+        const decoded = jwt.verify(token, getJwtSecret()) as { id: string };
+        req.user = { id: decoded.id };
+        next();
+    } catch {
+        return res.status(401).json({ error: 'Unauthorized: Invalid or expired token' });
     }
 };

@@ -1,404 +1,362 @@
 import express from 'express';
 import http from 'http';
-import { Server } from 'socket.io';
+import { Server, Socket } from 'socket.io';
 import cors from 'cors';
 import helmet from 'helmet';
-import jwt from 'jsonwebtoken';
-import { authenticate } from './middleware/auth';
+import { PrismaClient } from '@prisma/client';
+import { authenticate, AuthRequest } from './middleware/auth';
+import { verifyToken } from './utils/jwt';
 
-// Существующие контроллеры
 import { registerDevice, unregisterDevice, sendSilentMessagePush } from './controllers/device.controller';
 import { register, login } from './controllers/auth.controller';
-import { uploadKeys, getKeysBundle } from './controllers/keys.controller';
-import { getMyContacts, searchUsers, addContact, getMyProfile, updateMyProfile, sendFriendRequest, getPendingRequests, respondToFriendRequest, getPendingCountRequests} from './controllers/user.controller';
+import { uploadKeys, getKeysBundle, getRemainingPreKeys } from './controllers/keys.controller';
+import {
+  getMyContacts, searchUsers, addContact, getMyProfile, updateMyProfile,
+  sendFriendRequest, getPendingRequests, respondToFriendRequest, getPendingCountRequests
+} from './controllers/user.controller';
+import mediaRoutes from './routes/mediaRoutes';
 
-// ✅ НОВОЕ: Импорт роутера для работы с медиа (файлами)
-import mediaRoutes from './routes/mediaRoutes'; 
+const prisma = new PrismaClient();
 
-// === ХРАНИЛИЩА (на уровне модуля) ===
-const offlineMessages = new Map<string, Array<{
-  id: string;
-  senderId: string;
-  payload: any;
-  timestamp: number;
-  delivered: boolean;
-}>>();
-
- // ✅ ИСПРАВЛЕНИЕ: Выносим хранилища сокетов на уровень модуля, 
-  // чтобы роут /api/users/:userId/status мог к ним обращаться
-  const userSockets = new Map<string, string>();
-  const socketUsers = new Map<string, string>();
+// === СОСТОЯНИЕ СОКЕТОВ (в памяти — только маппинги, сообщения теперь в БД) ===
+// userId -> Set<socketId>: поддержка нескольких устройств одного пользователя
+const userSockets = new Map<string, Set<string>>();
+const socketUsers = new Map<string, string>();
 
 const readReceipts = new Map<string, { readBy: string[]; timestamp: number }>();
 
-const getChatKey = (id1: string, id2: string): string => {
-  return [id1, id2].sort().join(':');
+const getChatKey = (id1: string, id2: string): string => [id1, id2].sort().join(':');
+
+const addSocket = (userId: string, socketId: string) => {
+  if (!userSockets.has(userId)) userSockets.set(userId, new Set());
+  userSockets.get(userId)!.add(socketId);
+  socketUsers.set(socketId, userId);
 };
 
-function saveMessageToHistory(chatKey: string, message: {
-  id: string;
-  senderId: string;
-  payload: any;
-  timestamp: number;
-  delivered: boolean;
-}) {
-  if (!offlineMessages.has(chatKey)) {
-    offlineMessages.set(chatKey, []);
-  }
-  const messages = offlineMessages.get(chatKey)!;
-  messages.push(message);
-
-  if (messages.length > 100) {
-    messages.shift();
-  }
-}
-
-function sendOfflineMessages(userId: string, socket: any) {
-  for (const [chatKey, messages] of offlineMessages.entries()) {
-    if (chatKey.split(':').includes(userId)) {
-      const pending = messages.filter(m => !m.delivered && m.senderId !== userId);
-
-      for (const msg of pending) {
-        socket.emit('private_message', {
-          from: msg.senderId,
-          payload: msg.payload,
-          messageId: msg.id,
-          timestamp: msg.timestamp,
-          isOffline: true
-        });
-        msg.delivered = true;
-      }
-
-      if (pending.length > 0) {
-        console.log(`📬 Sent ${pending.length} offline messages to ${userId}`);
-      }
+// Возвращает userId, если у него больше не осталось активных сокетов
+const removeSocket = (socketId: string): string | null => {
+  const userId = socketUsers.get(socketId);
+  if (!userId) return null;
+  socketUsers.delete(socketId);
+  const set = userSockets.get(userId);
+  if (set) {
+    set.delete(socketId);
+    if (set.size === 0) {
+      userSockets.delete(userId);
+      return userId; // последний сокет отвалился
     }
   }
+  return null;
+};
+
+const emitToUser = (io: Server, userId: string, event: string, data: any) => {
+  const set = userSockets.get(userId);
+  if (!set) return;
+  for (const sid of set) io.to(sid).emit(event, data);
+};
+
+// Простой in-memory rate limiter для auth-эндпоинтов
+const authAttempts = new Map<string, { count: number; resetAt: number }>();
+function rateLimit(key: string, limit = 10, windowMs = 5 * 60 * 1000): boolean {
+  const now = Date.now();
+  const rec = authAttempts.get(key);
+  if (!rec || rec.resetAt < now) {
+    authAttempts.set(key, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  if (rec.count >= limit) return false;
+  rec.count++;
+  return true;
 }
 
 export const startServer = (port: number) => {
   const app = express();
   const server = http.createServer(app);
 
-  // Middleware
+  const allowed = (process.env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim());
+  const corsOptions = allowed.length === 1 && allowed[0] === '*' ? {} : { origin: allowed };
+
   app.use(helmet());
-  app.use(cors({ origin: '*' }));
-  app.use(express.json({ limit: '50mb' }));
+  app.use(cors(corsOptions));
+  app.use(express.json({ limit: '2mb' })); // 50mb для JSON не нужно, медиа идёт через multipart
 
   // === API ROUTES ===
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
   });
 
-  app.post('/api/register', register);
-  app.post('/api/login', login);
+  app.post('/api/register', (req, res, next) => {
+    const ip = req.ip || 'unknown';
+    if (!rateLimit(`reg:${ip}`)) return res.status(429).json({ error: 'Too many attempts' });
+    next();
+  }, register);
 
-  app.get('/api/users/search', searchUsers);
+  app.post('/api/login', (req, res, next) => {
+    const ip = req.ip || 'unknown';
+    if (!rateLimit(`login:${ip}`)) return res.status(429).json({ error: 'Too many attempts' });
+    next();
+  }, login);
+
+  // Всё ниже — только с валидным JWT. userId больше НЕ принимаем от клиента.
+  app.get('/api/users/search', authenticate, searchUsers);
   app.get('/api/myprofile', authenticate, getMyProfile);
   app.put('/api/myprofile', authenticate, updateMyProfile);
-  app.post('/api/contacts', addContact);
-  app.get('/api/contacts', getMyContacts);
 
-  app.post('/api/friend-requests', sendFriendRequest);
-  app.get('/api/friend-requests/pending', getPendingRequests);
-  app.get('/api/friends-requests/count', getPendingCountRequests)
-  app.post('/api/friend-requests/respond', respondToFriendRequest);
+  app.post('/api/contacts', authenticate, addContact);
+  app.get('/api/contacts', authenticate, getMyContacts);
 
-  app.post('/api/keys/upload', uploadKeys);
-  app.get('/api/keys/:userId', getKeysBundle);
+  app.post('/api/friend-requests', authenticate, sendFriendRequest);
+  app.get('/api/friend-requests/pending', authenticate, getPendingRequests);
+  app.get('/api/friends-requests/count', authenticate, getPendingCountRequests);
+  app.post('/api/friend-requests/respond', authenticate, respondToFriendRequest);
 
-  app.post('/api/devices/register', registerDevice);
-  app.delete('/api/devices/:deviceId', unregisterDevice);
+  app.post('/api/keys/upload', authenticate, uploadKeys);
+  app.get('/api/keys/:userId', authenticate, getKeysBundle);
+  app.get('/api/keys/count/remaining', authenticate, getRemainingPreKeys);
 
-  // ✅ НОВОЕ: Подключаем роутер медиа. 
+  app.post('/api/devices/register', authenticate, registerDevice);
+  app.delete('/api/devices/:deviceId', authenticate, unregisterDevice);
+
   app.use('/api/media', mediaRoutes);
 
-  //Проверка обнавления
+  // Проверка обновления приложения
   app.get('/api/updateapp', (req, res) => {
-    const express = require('express');
     const fs = require('fs');
     const path = require('path');
-    const version = "1.0"
+    const version = '1.0';
     const filePath = path.join(__dirname, '../apk/', `${version}.apk`);
-      
-      fs.stat(filePath, (err, stats) => {
-        if (err) {
-            return res.status(404).json({ error: 'Файл не найден' });
-        }
 
-        const jesUpdateApp = {
-          "latestVersion": version,
-          "changeLog": "Bug fixes and performance improvements.",
-          "mandatoryUpdate": false,
-          "fileSize": stats.size
-        }
-        res.json(jesUpdateApp);
+    fs.stat(filePath, (err: any, stats: any) => {
+      if (err) return res.status(404).json({ error: 'File not found' });
+      res.json({
+        latestVersion: version,
+        changeLog: 'Bug fixes and performance improvements.',
+        mandatoryUpdate: false,
+        fileSize: stats.size
       });
+    });
   });
 
   app.get('/api/apk/:version', (req, res) => {
+    const fs = require('fs');
+    const path = require('path');
+    const { version } = req.params;
+    // Версия — просто имя файла, валидируем чтобы не было traversal
+    if (!/^[a-zA-Z0-9._-]+$/.test(version)) {
+      return res.status(400).json({ error: 'Invalid version' });
+    }
+    const filePath = path.join(__dirname, '../apk/', `${version}.apk`);
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Disposition', `attachment; filename="${version}.apk"`);
+    res.sendFile(filePath);
+  });
+
+  // История сообщений чата. chatId = id собеседника.
+  // Авторизация: requester автоматически участник пары (chatKey из его id и chatId).
+  app.get('/api/chats/:chatId/messages', authenticate, async (req: AuthRequest, res) => {
     try {
-      const fs = require('fs');
-      const path = require('path');
-      const { version } = req.params;
-      const filePath = path.join(__dirname, '../apk/', `${version}.apk`);
-      
-      console.log(`🔍 DOWNLOAD DEBUG: ApkName=[${version}]`);
-      console.log(`🔍 DOWNLOAD DEBUG: UPLOAD_DIR=[../apk/]`);
-      console.log(`🔍 DOWNLOAD DEBUG: filePath=[${filePath}]`);
-      console.log(`🔍 DOWNLOAD DEBUG: exists=${fs.existsSync(filePath)}`);
-      
-      if (!fs.existsSync(filePath)) {
-        console.error(`❌ File not found at path: ${filePath}`);
-        res.status(404).json({ error: 'File not found' });
-        return;
+      const me = req.user!.id;
+      const peerId = req.params.chatId as string;
+      const since = req.query.since ? Number(req.query.since) : null;
+      if (since !== null && !Number.isFinite(since)) {
+        return res.status(400).json({ error: 'Invalid since' });
       }
-      
-      console.log(`✅ File found! Starting download: ${version}`);
-      res.setHeader('Content-Type', 'application/octet-stream');
-      res.setHeader('Content-Disposition', `attachment; filename="${version}.apk"`);
-      res.sendFile(filePath);
-      
+
+      const chatKey = getChatKey(me, peerId);
+      const messages = await prisma.message.findMany({
+        where: {
+          chatKey,
+          ...(since ? { timestamp: { gt: new Date(since) } } : {})
+        },
+        orderBy: { timestamp: 'asc' },
+        take: 500
+      });
+
+      res.json(messages.map(m => ({
+        id: m.id,
+        senderId: m.senderId,
+        payload: m.payload,
+        timestamp: m.timestamp.getTime(),
+        delivered: m.deliveredAt !== null
+      })));
     } catch (error) {
-      console.error('Download error:', error);
-      res.status(500).json({ error: 'Download failed' });
+      console.error('History error:', error);
+      res.status(500).json({ error: 'Failed to fetch messages' });
     }
   });
 
-  // === НОВЫЙ ENDPOINT: Получить историю сообщений чата ===
-  app.get('/api/chats/:chatId/messages', (req, res) => {
-    const { chatId } = req.params;
-    const { since } = req.query;
-    const userId = req.query.userId as string;
-
-    if (!userId) {
-      return res.status(400).json({ error: 'userId required' });
-    }
-
-    console.log(`📥 Fetching messages for chat: ${chatId}, user: ${userId}`);
-
-    const chatKey = getChatKey(userId, chatId);
-    const messages = offlineMessages.get(chatKey) || [];
-
-    const filtered = since
-      ? messages.filter(m => m.timestamp > Number(since))
-      : messages;
-
-    filtered.sort((a, b) => a.timestamp - b.timestamp);
-
-    console.log(`✅ Found ${filtered.length} messages for chat ${chatKey}`);
-    res.json(filtered);
-  });
-
-  app.get('/api/users/:userId/status', (req, res) => {
-    const { userId } = req.params;
-    const isOnline = userSockets.has(userId);
-    res.json({ userId, isOnline });
+  app.get('/api/users/:userId/status', authenticate, (req, res) => {
+    const userId = req.params.userId as string;
+    res.json({ userId, isOnline: userSockets.has(userId) });
   });
 
   // === SOCKET.IO ===
-  const io = new Server(server, { cors: { origin: '*' } });
+  const io = new Server(server, { cors: corsOptions });
 
-  io.on('connection', (socket) => {
-    console.log(`🔗 Client connected: ${socket.id}`);
+  // ⚠️ ВАЖНО: middleware регистрируется ЗДЕСЬ, до io.on('connection').
+  // В предыдущей версии io.use был внутри connection и НЕ защищал подключения.
+  io.use((socket, next) => {
+    const token = socket.handshake.auth?.token;
+    const decoded = token ? verifyToken(token) : null;
+    if (!decoded) return next(new Error('unauthorized'));
+    socket.data.userId = decoded.id;
+    next();
+  });
 
-    io.use((socket, next) => {
-      const token = socket.handshake.auth.token;
-      try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET!);
-        socket.data.userId = decoded.id;
-        next();
-      } catch {
-        next(new Error('unauthorized'));
+  io.on('connection', (socket: Socket) => {
+    const myUserId = socket.data.userId as string;
+    console.log(`🔗 Client connected: ${socket.id} (user ${myUserId})`);
+
+    const wasOffline = !userSockets.has(myUserId);
+    addSocket(myUserId, socket.id);
+
+    if (wasOffline) {
+      socket.broadcast.emit('user_status', { userId: myUserId, isOnline: true, timestamp: Date.now() });
+    }
+
+    // Догоняем недоставленные сообщения из БД
+    prisma.message.findMany({
+      where: {
+        deliveredAt: null,
+        senderId: { not: myUserId },
+        OR: [
+          { chatKey: { startsWith: `${myUserId}:` } },
+          { chatKey: { endsWith: `:${myUserId}` } }
+        ]
+      },
+      orderBy: { timestamp: 'asc' },
+      take: 200
+    }).then(async (pending) => {
+      for (const m of pending) {
+        socket.emit('private_message', {
+          from: m.senderId,
+          payload: m.payload,
+          messageId: m.id,
+          timestamp: m.timestamp.getTime(),
+          isOffline: true
+        });
       }
-    });
+      if (pending.length > 0) {
+        await prisma.message.updateMany({
+          where: { id: { in: pending.map(m => m.id) } },
+          data: { deliveredAt: new Date() }
+        });
+        console.log(`📬 Sent ${pending.length} offline messages to ${myUserId}`);
+      }
+    }).catch(console.error);
 
+    // join_room больше не принимает userId — личность из JWT (socket.data.userId)
     socket.on('join_room', () => {
-      const userId = socket.data.userId;
-      userSockets.set(userId, socket.id);
-      socketUsers.set(socket.id, userId);
-      console.log(`👤 User ${userId} joined with socket ${socket.id}`);
-
-      socket.broadcast.emit('user_status', {
-        userId,
-        isOnline: true,
-        timestamp: Date.now()
-      });
-      console.log(`📢 Broadcasted: User ${userId} is online`);
-
-      sendOfflineMessages(userId, socket);
+      console.log(`👤 User ${myUserId} joined with socket ${socket.id}`);
     });
 
-    socket.on('private_message', (data) => {
-      const { to, payload, messageId, typeMsg } = data;
-      const from = socketUsers.get(socket.id);
+    socket.on('private_message', async (data) => {
+      const from = socket.data.userId as string; // только из токена
+      const { to, payload, messageId, typeMsg } = data || {};
+      if (!from || !to || !payload || !messageId) return;
 
-      if (!from) return;
+      const receiver = await prisma.user.findUnique({ where: { id: to }, select: { id: true } });
+      if (!receiver) return;
 
-      const receiverSocketId = userSockets.get(to);
       const chatKey = getChatKey(from, to);
+      const ts = Date.now();
 
-      if (receiverSocketId) {
-        // Обычная логика: Получатель онлайн, шлем по быстрому сокету
-        io.to(receiverSocketId).emit('private_message', {
-          from,
-          payload,
-          messageId,
-          timestamp: Date.now()
-        });
-        
-        saveMessageToHistory(chatKey, {
+      // БД — источник истины. payload уже зашифрован клиентом (E2E).
+      await prisma.message.upsert({
+        where: { id: messageId },
+        update: {},
+        create: {
           id: messageId,
+          chatKey,
           senderId: from,
           payload,
-          timestamp: Date.now(),
-          delivered: true
-        });
-        console.log(`📩 Message ${messageId} sent from ${from} to ${to}`);
+          typeMsg: typeof typeMsg === 'string' ? typeMsg : 'text',
+          timestamp: new Date(ts)
+        }
+      });
+
+      if (userSockets.has(to)) {
+        emitToUser(io, to, 'private_message', { from, payload, messageId, timestamp: ts });
+        // deliveredAt — best effort на emit; если пакет потерян, сообщение
+        // всё равно останется в БД и придёт через history/offline-догон
+        prisma.message.update({
+          where: { id: messageId },
+          data: { deliveredAt: new Date() }
+        }).catch(() => {});
       } else {
-        // Получатель оффлайн: Сохраняем в оффлайн мапу сокета
-        saveMessageToHistory(chatKey, {
-          id: messageId,
-          senderId: from,
-          payload,
-          timestamp: Date.now(),
-          delivered: false
-        });
-        console.log(`💾 Message ${messageId} saved for offline user ${to}`);
-
-        // 🌟 ИСПРАВЛЕНИЕ: Вызываем наш новый метод пуша из контроллера Prisma!
-        // Firebase разбудит Android, сервис MyFirebaseMessagingService расшифрует payload и запишет в Room
-        sendSilentMessagePush(to, from, messageId, payload, typeMsg);
+        sendSilentMessagePush(to, from, messageId, payload, typeMsg ?? 'text');
       }
     });
 
     socket.on('message_action', (data) => {
-      const { chatId, payload, messageId } = data;
-      const from = socketUsers.get(socket.id);
+      const from = socket.data.userId as string;
       if (!from) return;
+      const { chatId, payload, messageId } = data || {};
 
-      for (const [key, socketId] of userSockets.entries()) {
-        if (key !== from) {
-          io.to(socketId).emit('message_action', {
-            from,
-            payload,
-            messageId,
-            timestamp: Date.now()
-          });
-        }
-      }
-      console.log(`⚡ Action sent from ${from} in chat ${chatId}`);
+      // chatId = id собеседника: шлём только ему
+      emitToUser(io, chatId, 'message_action', {
+        from, payload, messageId, timestamp: Date.now()
+      });
     });
 
     socket.on('delivery_receipt', (data) => {
-      const { messageId, chatId } = data;
-      const userId = socketUsers.get(socket.id);
+      const userId = socket.data.userId as string;
       if (!userId) return;
+      const { messageId, chatId } = data || {};
 
-      const chatKey = getChatKey(userId, chatId);
-      let sentCount = 0;
+      prisma.message.updateMany({
+        where: { id: messageId },
+        data: { deliveredAt: new Date() }
+      }).catch(() => {});
 
-      for (const [key, socketId] of userSockets.entries()) {
-        if (key !== userId && chatKey.split(':').includes(key)) {
-          io.to(socketId).emit('message_delivered', {
-            messageId,
-            deliveredBy: userId,
-            timestamp: Date.now()
-          });
-          sentCount++;
-        }
-      }
-      console.log(`✅ Server forwarded delivery_receipt for ${messageId} to ${sentCount} recipients user ${userId} to ${chatId}`);
+      emitToUser(io, chatId, 'message_delivered', {
+        messageId, deliveredBy: userId, timestamp: Date.now()
+      });
     });
 
     socket.on('read_receipt', (data) => {
-      const { messageId, chatId } = data;
-      const userId = socketUsers.get(socket.id);
-
+      const userId = socket.data.userId as string;
       if (!userId) return;
+      const { messageId, chatId } = data || {};
 
       if (!readReceipts.has(messageId)) {
         readReceipts.set(messageId, { readBy: [], timestamp: Date.now() });
       }
       const receipt = readReceipts.get(messageId)!;
-      if (!receipt.readBy.includes(userId)) {
-        receipt.readBy.push(userId);
-      }
+      if (!receipt.readBy.includes(userId)) receipt.readBy.push(userId);
 
-      const chatKey = getChatKey(userId, chatId);
-
-      for (const [key, socketId] of userSockets.entries()) {
-        if (key !== userId && chatKey.split(':').includes(key)) {
-          io.to(socketId).emit('message_read', {
-            messageId,
-            readBy: userId,
-            timestamp: Date.now()
-          });
-        }
-      }
-      console.log(`✅ Read receipt for ${messageId} from ${userId} to ${chatId}`);
+      emitToUser(io, chatId, 'message_read', {
+        messageId, readBy: userId, timestamp: Date.now()
+      });
     });
 
-    socket.on('typing_start', (data) => {
-      const { chatId } = data;
-      const userId = socketUsers.get(socket.id);
-      if (!userId) return;
-
-      const chatKey = getChatKey(userId, chatId);
-
-      for (const [key, socketId] of userSockets.entries()) {
-        if (key !== userId && chatKey.split(':').includes(key)) {
-          io.to(socketId).emit('user_typing', {
-            userId,
-            chatId,
-            isTyping: true,
-            timestamp: Date.now()
-          });
-        }
-      }
-      console.log(`✍️ ${userId} started typing in chat ${chatId}`);
-    });
-
-    socket.on('typing_stop', (data) => {
-      const { chatId } = data;
-      const userId = socketUsers.get(socket.id);
-      if (!userId) return;
-
-      const chatKey = getChatKey(userId, chatId);
-
-      for (const [key, socketId] of userSockets.entries()) {
-        if (key !== userId && chatKey.split(':').includes(key)) {
-          io.to(socketId).emit('user_typing', {
-            userId,
-            chatId,
-            isTyping: false,
-            timestamp: Date.now()
-          });
-        }
-      }
-      console.log(`🛑 ${userId} stopped typing in chat ${chatId}`);
-    });
+    const handleTyping = (chatId: string, isTyping: boolean) => {
+      const userId = socket.data.userId as string;
+      if (!userId || !chatId) return;
+      emitToUser(io, chatId, 'user_typing', {
+        userId, chatId, isTyping, timestamp: Date.now()
+      });
+    };
+    socket.on('typing_start', (d) => handleTyping(d?.chatId, true));
+    socket.on('typing_stop', (d) => handleTyping(d?.chatId, false));
 
     socket.on('disconnect', () => {
-      const userId = socketUsers.get(socket.id);
-      if (userId) {
-        userSockets.delete(userId);
-        socketUsers.delete(socket.id);
-        console.log(`🔌 User ${userId} disconnected`);
-
+      const fullyOffline = removeSocket(socket.id);
+      if (fullyOffline) {
+        console.log(`🔌 User ${fullyOffline} fully disconnected`);
         socket.broadcast.emit('user_status', {
-          userId,
-          isOnline: false,
-          timestamp: Date.now()
+          userId: fullyOffline, isOnline: false, timestamp: Date.now()
         });
-        console.log(`📢 Broadcasted: User ${userId} is offline`);
       }
     });
   });
 
   server.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${port}`);
-    console.log(`📝 API: https://messenger.insolent-castoms.ru/api`);
   });
 
   return { app, io, server };
