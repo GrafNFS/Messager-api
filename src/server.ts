@@ -9,7 +9,7 @@ import { verifyToken } from './utils/jwt';
 
 import { registerDevice, unregisterDevice, sendSilentMessagePush } from './controllers/device.controller';
 import { register, login } from './controllers/auth.controller';
-import { uploadKeys, getKeysBundle, getRemainingPreKeys, uploadOneTimeKeys } from './controllers/keys.controller';
+import { uploadKeys, getKeysBundle, getRemainingPreKeys } from './controllers/keys.controller';
 import {
   getMyContacts, searchUsers, addContact, getMyProfile, updateMyProfile,
   sendFriendRequest, getPendingRequests, respondToFriendRequest, getPendingCountRequests
@@ -17,6 +17,15 @@ import {
 import mediaRoutes from './routes/mediaRoutes';
 
 const prisma = new PrismaClient();
+
+// ✅ Страховка: одна необработанная ошибка в сокет-хендлере не должна ронять
+// весь процесс (Node 22 по умолчанию умирает на unhandledRejection).
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ Unhandled rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ Uncaught exception:', err);
+});
 
 // === СОСТОЯНИЕ СОКЕТОВ (в памяти — только маппинги, сообщения теперь в БД) ===
 // userId -> Set<socketId>: поддержка нескольких устройств одного пользователя
@@ -116,7 +125,6 @@ export const startServer = (port: number) => {
 
   app.post('/api/devices/register', authenticate, registerDevice);
   app.delete('/api/devices/:deviceId', authenticate, unregisterDevice);
-  app.post('/api/keys/one-time', authenticate, uploadOneTimeKeys);
 
   app.use('/api/media', mediaRoutes);
 
@@ -190,29 +198,6 @@ export const startServer = (port: number) => {
     }
   });
 
-  // Список собеседников текущего пользователя (для глобального догона сообщений)
-app.get('/api/chats', authenticate, async (req: AuthRequest, res) => {
-  try {
-    const me = req.user!.id;
-    const rows = await prisma.message.findMany({
-      where: {
-        OR: [
-          { chatKey: { startsWith: `${me}:` } },
-          { chatKey: { endsWith: `:${me}` } }
-        ]
-      },
-      select: { chatKey: true },
-      distinct: ['chatKey']
-    });
-    const peers = rows
-      .map(r => r.chatKey.split(':').find(p => p !== me))
-      .filter((p): p is string => !!p);
-    res.json(peers);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch chats' });
-  }
-});
-
   app.get('/api/users/:userId/status', authenticate, (req, res) => {
     const userId = req.params.userId as string;
     res.json({ userId, isOnline: userSockets.has(userId) });
@@ -283,36 +268,63 @@ app.get('/api/chats', authenticate, async (req: AuthRequest, res) => {
       const { to, payload, messageId, typeMsg } = data || {};
       if (!from || !to || !payload || !messageId) return;
 
-      const receiver = await prisma.user.findUnique({ where: { id: to }, select: { id: true } });
-      if (!receiver) return;
+      try {
+        const receiver = await prisma.user.findUnique({ where: { id: to }, select: { id: true } });
+        if (!receiver) return;
 
-      const chatKey = getChatKey(from, to);
-      const ts = Date.now();
+        const chatKey = getChatKey(from, to);
+        const ts = Date.now();
 
-      // БД — источник истины. payload уже зашифрован клиентом (E2E).
-      await prisma.message.upsert({
-        where: { id: messageId },
-        update: {},
-        create: {
-          id: messageId,
-          chatKey,
-          senderId: from,
-          payload,
-          typeMsg: typeof typeMsg === 'string' ? typeMsg : 'text',
-          timestamp: new Date(ts)
+        // БД — источник истины. payload уже зашифрован клиентом (E2E).
+        // ⚠️ Дедупликация: клиент ретраит отправку при обрыве → тот же messageId.
+        //    upsert(update:{}) на MySQL бросает P2002 (конфликт PRIMARY) — процесс падал,
+        //    поэтому явный find → create.
+        const existing = await prisma.message.findUnique({ where: { id: messageId } });
+        if (existing) {
+          // Повторная отправка того же сообщения: догоняем доставку, не дублируя в БД
+          if (userSockets.has(to)) {
+            emitToUser(io, to, 'private_message', { from, payload, messageId, timestamp: ts });
+          } else {
+            sendSilentMessagePush(to, from, messageId, payload, existing.typeMsg ?? 'text');
+          }
+          if (!existing.deliveredAt) {
+            await prisma.message.update({
+              where: { id: messageId },
+              data: { deliveredAt: new Date() }
+            }).catch(() => {});
+          }
+          return;
         }
-      });
 
-      if (userSockets.has(to)) {
-        emitToUser(io, to, 'private_message', { from, payload, messageId, timestamp: ts });
-        // deliveredAt — best effort на emit; если пакет потерян, сообщение
-        // всё равно останется в БД и придёт через history/offline-догон
-        prisma.message.update({
-          where: { id: messageId },
-          data: { deliveredAt: new Date() }
-        }).catch(() => {});
-      } else {
-        sendSilentMessagePush(to, from, messageId, payload, typeMsg ?? 'text');
+        try {
+          await prisma.message.create({
+            data: {
+              id: messageId,
+              chatKey,
+              senderId: from,
+              payload,
+              typeMsg: typeof typeMsg === 'string' ? typeMsg : 'text',
+              timestamp: new Date(ts)
+            }
+          });
+        } catch (e: any) {
+          if (e?.code === 'P2002') return; // гонка двух одинаковых messageId — дубликат игнорим
+          throw e;
+        }
+
+        if (userSockets.has(to)) {
+          emitToUser(io, to, 'private_message', { from, payload, messageId, timestamp: ts });
+          // deliveredAt — best effort на emit; если пакет потерян, сообщение
+          // всё равно останется в БД и придёт через history/offline-догон
+          prisma.message.update({
+            where: { id: messageId },
+            data: { deliveredAt: new Date() }
+          }).catch(() => {});
+        } else {
+          sendSilentMessagePush(to, from, messageId, payload, typeMsg ?? 'text');
+        }
+      } catch (e) {
+        console.error('private_message error:', e);
       }
     });
 
