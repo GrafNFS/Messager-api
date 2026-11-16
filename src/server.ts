@@ -190,6 +190,29 @@ export const startServer = (port: number) => {
     }
   });
 
+  // Список собеседников текущего пользователя (для глобального догона сообщений)
+app.get('/api/chats', authenticate, async (req: AuthRequest, res) => {
+  try {
+    const me = req.user!.id;
+    const rows = await prisma.message.findMany({
+      where: {
+        OR: [
+          { chatKey: { startsWith: `${me}:` } },
+          { chatKey: { endsWith: `:${me}` } }
+        ]
+      },
+      select: { chatKey: true },
+      distinct: ['chatKey']
+    });
+    const peers = rows
+      .map(r => r.chatKey.split(':').find(p => p !== me))
+      .filter((p): p is string => !!p);
+    res.json(peers);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch chats' });
+  }
+});
+
   app.get('/api/users/:userId/status', authenticate, (req, res) => {
     const userId = req.params.userId as string;
     res.json({ userId, isOnline: userSockets.has(userId) });
