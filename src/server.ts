@@ -15,6 +15,7 @@ import {
   sendFriendRequest, getPendingRequests, respondToFriendRequest, getPendingCountRequests
 } from './controllers/user.controller';
 import mediaRoutes from './routes/mediaRoutes';
+import { createGroup, getMyGroups, addGroupMember, removeGroupMember, getGroupMembers } from './controllers/group.controller';
 
 const prisma = new PrismaClient();
 
@@ -126,6 +127,13 @@ export const startServer = (port: number) => {
   app.post('/api/devices/register', authenticate, registerDevice);
   app.delete('/api/devices/:deviceId', authenticate, unregisterDevice);
 
+  // === ГРУППОВЫЕ ЧАТЫ ===
+  app.post('/api/groups', authenticate, createGroup);
+  app.get('/api/groups', authenticate, getMyGroups);
+  app.get('/api/groups/:groupId/members', authenticate, getGroupMembers);
+  app.post('/api/groups/:groupId/members', authenticate, addGroupMember);
+  app.delete('/api/groups/:groupId/members/:userId', authenticate, removeGroupMember);
+
   app.use('/api/media', mediaRoutes);
 
   // Проверка обновления приложения
@@ -164,8 +172,50 @@ export const startServer = (port: number) => {
     res.sendFile(filePath);
   });
 
-  // История сообщений чата. chatId = id собеседника.
-  // Авторизация: requester автоматически участник пары (chatKey из его id и chatId).
+  // Список чатов текущего пользователя: прямые собеседники + мои группы
+  // (для глобального догона сообщений на клиенте)
+  app.get('/api/chats', authenticate, async (req: AuthRequest, res) => {
+    try {
+      const me = req.user!.id;
+
+      // Прямые чаты
+      const rows = await prisma.message.findMany({
+        where: {
+          OR: [
+            { chatKey: { startsWith: `${me}:` } },
+            { chatKey: { endsWith: `:${me}` } }
+          ]
+        },
+        select: { chatKey: true },
+        distinct: ['chatKey']
+      });
+      const peers = rows
+        .map(r => r.chatKey.split(':').find(p => p !== me))
+        .filter((p): p is string => !!p);
+
+      // Группы, где я состою и где есть сообщения
+      const myGroups = await prisma.groupMember.findMany({
+        where: { userId: me },
+        select: { groupId: true }
+      });
+      const groupKeys = myGroups.map(g => `group:${g.groupId}`);
+      const groupMsgs = groupKeys.length
+        ? await prisma.message.findMany({
+            where: { chatKey: { in: groupKeys } },
+            select: { chatKey: true },
+            distinct: ['chatKey']
+          })
+        : [];
+      const groupIds = groupMsgs.map(g => g.chatKey.substring('group:'.length));
+
+      res.json([...peers, ...groupIds]);
+    } catch (error) {
+      res.status(500).json({ error: 'Failed to fetch chats' });
+    }
+  });
+
+  // История сообщений чата. chatId = id собеседника ИЛИ id группы.
+  // Авторизация: личный чат — requester участник пары; группа — проверка membership.
   app.get('/api/chats/:chatId/messages', authenticate, async (req: AuthRequest, res) => {
     try {
       const me = req.user!.id;
@@ -175,7 +225,19 @@ export const startServer = (port: number) => {
         return res.status(400).json({ error: 'Invalid since' });
       }
 
-      const chatKey = getChatKey(me, peerId);
+      // groupId → история группы; иначе — личный чат
+      const isGroup = await prisma.group.findUnique({
+        where: { id: peerId },
+        select: { id: true }
+      });
+      const chatKey = isGroup ? `group:${peerId}` : getChatKey(me, peerId);
+      if (isGroup) {
+        const isMember = await prisma.groupMember.findUnique({
+          where: { groupId_userId: { groupId: peerId, userId: me } }
+        });
+        if (!isMember) return res.status(403).json({ error: 'Not a group member' });
+      }
+
       const messages = await prisma.message.findMany({
         where: {
           chatKey,
@@ -195,29 +257,6 @@ export const startServer = (port: number) => {
     } catch (error) {
       console.error('History error:', error);
       res.status(500).json({ error: 'Failed to fetch messages' });
-    }
-  });
-
-  // Список собеседников текущего пользователя (для глобального догона сообщений)
-  app.get('/api/chats', authenticate, async (req: AuthRequest, res) => {
-    try {
-      const me = req.user!.id;
-      const rows = await prisma.message.findMany({
-        where: {
-          OR: [
-            { chatKey: { startsWith: `${me}:` } },
-            { chatKey: { endsWith: `:${me}` } }
-          ]
-        },
-        select: { chatKey: true },
-        distinct: ['chatKey']
-      });
-      const peers = rows
-        .map(r => r.chatKey.split(':').find(p => p !== me))
-        .filter((p): p is string => !!p);
-      res.json(peers);
-    } catch (error) {
-      res.status(500).json({ error: 'Failed to fetch chats' });
     }
   });
 
@@ -348,6 +387,72 @@ export const startServer = (port: number) => {
         }
       } catch (e) {
         console.error('private_message error:', e);
+      }
+    });
+
+    // === ГРУППОВЫЕ СООБЩЕНИЯ (вариант А: pairwise-шифрование на клиенте) ===
+    // Клиент присылает payloads: [{userId, type, data}] — зашифровано для КАЖДОГО
+    // участника отдельно. Сервер хранит всё и раздаёт каждому его entry.
+    socket.on('group_message', async (data) => {
+      const from = socket.data.userId as string;
+      const { groupId, payloads, messageId, typeMsg } = data || {};
+      if (!from || !groupId || !Array.isArray(payloads) || !messageId) return;
+
+      try {
+        // Отправитель должен быть участником
+        const membership = await prisma.groupMember.findUnique({
+          where: { groupId_userId: { groupId, userId: from } }
+        });
+        if (!membership) return;
+
+        const members = await prisma.groupMember.findMany({
+          where: { groupId, userId: { not: from } },
+          select: { userId: true }
+        });
+        const recipientIds = members.map(m => m.userId);
+        const chatKey = `group:${groupId}`;
+        const ts = Date.now();
+
+        // Дедупликация (ретраи клиента)
+        const existing = await prisma.message.findUnique({ where: { id: messageId } });
+        if (existing) return;
+        try {
+          await prisma.message.create({
+            data: {
+              id: messageId,
+              chatKey,
+              senderId: from,
+              payload: { payloads },
+              typeMsg: typeof typeMsg === 'string' ? typeMsg : 'text',
+              timestamp: new Date(ts)
+            }
+          });
+        } catch (e: any) {
+          if (e?.code === 'P2002') return;
+          throw e;
+        }
+
+        // Маршрутизация: каждому получателю — его собственный зашифрованный entry
+        const payloadMap = new Map<string, { type: number; data: string }>(
+          payloads.map((p: any) => [p.userId, { type: p.type, data: p.data }])
+        );
+
+        for (const uid of recipientIds) {
+          const entry = payloadMap.get(uid);
+          if (!entry) continue; // отправитель не зашифровал для этого участника — пропуск
+
+          if (userSockets.has(uid)) {
+            emitToUser(io, uid, 'group_message', {
+              groupId, from,
+              payload: entry,
+              messageId, timestamp: ts
+            });
+          } else {
+            sendSilentMessagePush(uid, from, messageId, entry, typeMsg ?? 'text');
+          }
+        }
+      } catch (e) {
+        console.error('group_message error:', e);
       }
     });
 
