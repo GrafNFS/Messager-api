@@ -10,6 +10,38 @@ const MEMBER_SELECT = {
   }
 };
 
+// === СИСТЕМНЫЕ СООБЩЕНИЯ ГРУПП ===
+// Не шифруются (payload = { system: true, text }) — читаются всеми участниками.
+
+async function getUserName(userId: string): Promise<string> {
+  const u = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { displayName: true, username: true }
+  });
+  return u?.displayName || u?.username || 'Пользователь';
+}
+
+async function postSystemMessage(req: AuthRequest, groupId: string, actorId: string, text: string) {
+  try {
+    const messageId = `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    await prisma.message.create({
+      data: {
+        id: messageId,
+        chatKey: `group:${groupId}`,
+        senderId: actorId,
+        payload: { system: true, text },
+        typeMsg: 'system',
+        timestamp: new Date()
+      }
+    });
+    // Рассылка онлайн-участникам (groupEmit регистрируется в server.ts)
+    const emit = (req.app as any).get('groupEmit');
+    emit?.(groupId, 'system_message', { groupId, messageId, text, timestamp: Date.now() });
+  } catch (e) {
+    console.error('postSystemMessage error:', e);
+  }
+}
+
 // Создать группу. body: { name, memberIds: string[] } — создатель становится OWNER
 export const createGroup = async (req: AuthRequest, res: Response) => {
   try {
@@ -41,6 +73,9 @@ export const createGroup = async (req: AuthRequest, res: Response) => {
       },
       include: { members: { include: MEMBER_SELECT } }
     });
+
+    const actorName = await getUserName(me);
+    await postSystemMessage(req, group.id, me, `${actorName} создал группу «${name.trim()}»`);
 
     res.status(201).json(group);
   } catch (error) {
@@ -136,6 +171,9 @@ export const addGroupMember = async (req: AuthRequest, res: Response) => {
       create: { groupId, userId, role: 'MEMBER' }
     });
 
+    const [actorName, targetName] = await Promise.all([getUserName(me), getUserName(userId)]);
+    await postSystemMessage(req, groupId, me, `${actorName} добавил ${targetName}`);
+
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to add member' });
@@ -165,6 +203,12 @@ export const removeGroupMember = async (req: AuthRequest, res: Response) => {
     await prisma.groupMember.delete({
       where: { groupId_userId: { groupId, userId } }
     });
+
+    const actorName = await getUserName(me);
+    const text = isSelfLeave
+      ? `${actorName} вышел из группы`
+      : `${actorName} исключил ${await getUserName(userId)}`;
+    await postSystemMessage(req, groupId, me, text);
 
     res.json({ success: true });
   } catch (error) {

@@ -268,6 +268,13 @@ export const startServer = (port: number) => {
   // === SOCKET.IO ===
   const io = new Server(server, { cors: corsOptions });
 
+  // Маршрутизация групповых событий из контроллеров (системные сообщения)
+  app.set('groupEmit', (groupId: string, event: string, data: any) => {
+    prisma.groupMember.findMany({ where: { groupId }, select: { userId: true } })
+      .then(members => { for (const m of members) emitToUser(io, m.userId, event, data); })
+      .catch(console.error);
+  });
+
   // ⚠️ ВАЖНО: middleware регистрируется ЗДЕСЬ, до io.on('connection').
   // В предыдущей версии io.use был внутри connection и НЕ защищал подключения.
   io.use((socket, next) => {
@@ -453,6 +460,31 @@ export const startServer = (port: number) => {
         }
       } catch (e) {
         console.error('group_message error:', e);
+      }
+    });
+
+    // Тайпинг в группах: ретрансляция остальным участникам
+    socket.on('group_typing', async (data) => {
+      const from = socket.data.userId as string;
+      const { groupId, isTyping } = data || {};
+      if (!from || !groupId) return;
+      try {
+        const membership = await prisma.groupMember.findUnique({
+          where: { groupId_userId: { groupId, userId: from } }
+        });
+        if (!membership) return;
+
+        const members = await prisma.groupMember.findMany({
+          where: { groupId, userId: { not: from } },
+          select: { userId: true }
+        });
+        for (const m of members) {
+          emitToUser(io, m.userId, 'group_typing', {
+            groupId, userId: from, isTyping: !!isTyping, timestamp: Date.now()
+          });
+        }
+      } catch (e) {
+        console.error('group_typing error:', e);
       }
     });
 
