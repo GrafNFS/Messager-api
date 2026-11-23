@@ -19,6 +19,21 @@ export class MediaController {
         return;
       }
 
+      // ✅ Проверка целостности: клиент передаёт ожидаемый размер (?size=).
+      //    Если тело запроса обрезано по пути (прокси/сеть) — отклоняем,
+      //    чтобы обрезок не лёг в хранилище и не отвечал 200.
+      const declaredSize = Number(req.query.size);
+      if (Number.isFinite(declaredSize) && declaredSize > 0 && file.size !== declaredSize) {
+        fs.unlink(file.path, () => {}); // удаляем обрезок
+        console.warn(`⚠️ Upload size mismatch for ${fileId}: declared ${declaredSize}, got ${file.size} — rejected`);
+        res.status(400).json({
+          error: 'Size mismatch',
+          expected: declaredSize,
+          got: file.size
+        });
+        return;
+      }
+
       const tmpPath = file.path;
       const finalPath = path.join(UPLOAD_DIR, `${fileId}.enc`);
 
@@ -47,6 +62,7 @@ export class MediaController {
         return;
       }
 
+      // res.sendFile поддерживает Range автоматически (206 + докачка)
       res.setHeader('Content-Type', 'application/octet-stream');
       res.setHeader('Content-Disposition', `attachment; filename="${fileId}.enc"`);
       res.sendFile(filePath);
