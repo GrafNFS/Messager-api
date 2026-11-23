@@ -141,3 +141,17 @@ export const uploadOneTimeKeys = async (req: AuthRequest, res: Response) => {
     res.status(500).json({ error: 'Failed to upload one-time keys' });
   }
 };
+
+export const getIdentityKey = async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.params.userId as string;
+    const keys = await prisma.cryptoKeys.findUnique({
+      where: { userId },
+      select: { identityKey: true }
+    });
+    if (!keys || keys.identityKey === 'pending') {
+      return res.status(404).json({ error: 'Keys not found' });
+    }
+    res.json({ identityKey: keys.identityKey });
+  } catch { res.status(500).json({ error: 'Failed' }); }
+};

@@ -9,7 +9,7 @@ import { verifyToken } from './utils/jwt';
 
 import { registerDevice, unregisterDevice, sendSilentMessagePush } from './controllers/device.controller';
 import { register, login } from './controllers/auth.controller';
-import { uploadKeys, getKeysBundle, getRemainingPreKeys } from './controllers/keys.controller';
+import { uploadKeys, getKeysBundle, getRemainingPreKeys, getIdentityKey } from './controllers/keys.controller';
 import {
   getMyContacts, searchUsers, addContact, getMyProfile, updateMyProfile,
   sendFriendRequest, getPendingRequests, respondToFriendRequest, getPendingCountRequests
@@ -126,6 +126,7 @@ export const startServer = (port: number) => {
 
   app.post('/api/devices/register', authenticate, registerDevice);
   app.delete('/api/devices/:deviceId', authenticate, unregisterDevice);
+  app.get('/api/keys/:userId/identity', authenticate, getIdentityKey);
 
   // === ГРУППОВЫЕ ЧАТЫ ===
   app.post('/api/groups', authenticate, createGroup);
