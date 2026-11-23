@@ -196,8 +196,35 @@ export const removeGroupMember = async (req: AuthRequest, res: Response) => {
     if (!isSelfLeave && myMembership.role !== 'OWNER') {
       return res.status(403).json({ error: 'Only owner can remove members' });
     }
+
+    // Владелец выходит: передаём права самому раннему участнику;
+    // если группа опустела — удаляем её целиком
     if (isSelfLeave && myMembership.role === 'OWNER') {
-      return res.status(400).json({ error: 'Owner cannot leave. Transfer ownership first (not implemented).' });
+      const others = await prisma.groupMember.findMany({
+        where: { groupId, userId: { not: me } },
+        orderBy: { joinedAt: 'asc' },
+        take: 1
+      });
+
+      await prisma.groupMember.delete({
+        where: { groupId_userId: { groupId, userId: me } }
+      });
+
+      const actorName = await getUserName(me);
+      if (others.length > 0) {
+        await prisma.groupMember.update({
+          where: { groupId_userId: { groupId, userId: others[0].userId } },
+          data: { role: 'OWNER' }
+        });
+        const heirName = await getUserName(others[0].userId);
+        await postSystemMessage(req, groupId, me,
+          `${actorName} вышел из группы. Новый владелец: ${heirName}`);
+      } else {
+        // Группа пуста: удаляем и группу, и её историю
+        await prisma.group.delete({ where: { id: groupId } });
+        await prisma.message.deleteMany({ where: { chatKey: `group:${groupId}` } });
+      }
+      return res.json({ success: true });
     }
 
     await prisma.groupMember.delete({
