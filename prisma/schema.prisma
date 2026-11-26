@@ -40,6 +40,7 @@ model User {
   status        UserStatus @default(ACTIVE)
 
   cryptoKeys    CryptoKeys?
+  deviceKeys    DeviceKeys[]
   contacts      Contact[]      @relation("UserContacts")
   contactedBy   Contact[]      @relation("UserContactedBy")
   devices       Device[]
@@ -59,18 +60,17 @@ enum UserStatus {
   DELETED
 }
 
-// 2. КРИПТОГРАФИЧЕСКИЕ КЛЮЧИ (Signal Protocol) — только ПУБЛИЧНЫЕ ключи
+// 2а. ЛЕГАСИ КЛЮЧИ (один ключ на юзера) — сохраняем для миграции; новый код использует DeviceKeys
 model CryptoKeys {
   userId             String   @id
-  identityKey        String   // Base64: публичный Identity Key
+  identityKey        String
   signedPreKeyId     Int
-  signedPreKeyPublic String   // Base64
-  signedPreKeySig    String   // Base64: подпись Signed PreKey
+  signedPreKeyPublic String
+  signedPreKeySig    String
   registrationId     Int?
   lastBundleUpdate   DateTime @default(now())
 
   oneTimePreKeys     OneTimePreKey[]
-
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
@@ -78,11 +78,40 @@ model OneTimePreKey {
   id        String @id @default(uuid())
   userId    String
   keyId     Int
-  publicKey String // Base64
+  publicKey String
 
   cryptoKeys CryptoKeys @relation(fields: [userId], references: [userId], onDelete: Cascade)
 
   @@unique([userId, keyId])
+}
+
+// 2б. КЛЮЧИ НА УСТРОЙСТВО (мульти-девайс) — по одному identity-key на устройство
+model DeviceKeys {
+  userId             String
+  deviceId           String
+  identityKey        String
+  signedPreKeyId     Int
+  signedPreKeyPublic String
+  signedPreKeySig    String
+  registrationId     Int?
+  lastBundleUpdate   DateTime @default(now())
+
+  user           User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  oneTimePreKeys DeviceOneTimePreKey[]
+
+  @@id([userId, deviceId])
+}
+
+model DeviceOneTimePreKey {
+  id        String @id @default(uuid())
+  userId    String
+  deviceId  String
+  keyId     Int
+  publicKey String
+
+  keys DeviceKeys @relation(fields: [userId, deviceId], references: [userId, deviceId], onDelete: Cascade)
+
+  @@unique([userId, deviceId, keyId])
 }
 
 // 3. КОНТАКТЫ
@@ -167,11 +196,10 @@ enum VerificationType {
   PHONE_VERIFY
 }
 
-// 7. СООБЩЕНИЯ — персистентность вместо in-memory Map.
-// payload — JSON с зашифрованным клиентом шифртекстом (E2E): { type, data }
+// 7. СООБЩЕНИЯ
 model Message {
-  id          String    @id              // messageId от клиента (UUID)
-  chatKey     String                      // "userA:userB" (отсортированная пара)
+  id          String    @id
+  chatKey     String
   senderId    String
   payload     Json
   typeMsg     String?
@@ -182,7 +210,6 @@ model Message {
   @@index([chatKey, timestamp])
   @@index([chatKey, deliveredAt])
 }
-
 
 // 8. ГРУППОВЫЕ ЧАТЫ
 model Group {

@@ -6,21 +6,25 @@ import helmet from 'helmet';
 import { PrismaClient } from '@prisma/client';
 import { authenticate, AuthRequest } from './middleware/auth';
 import { verifyToken } from './utils/jwt';
+import path from 'path';
 
 import { registerDevice, unregisterDevice, sendSilentMessagePush } from './controllers/device.controller';
 import { register, login } from './controllers/auth.controller';
-import { uploadKeys, getKeysBundle, getRemainingPreKeys, getIdentityKey } from './controllers/keys.controller';
+import {
+  uploadKeys, getDevicesBundle, getIdentityKey, getRemainingPreKeys, uploadOneTimeKeys
+} from './controllers/keys.controller';
 import {
   getMyContacts, searchUsers, addContact, getMyProfile, updateMyProfile,
   sendFriendRequest, getPendingRequests, respondToFriendRequest, getPendingCountRequests
 } from './controllers/user.controller';
+import {
+  createGroup, getMyGroups, addGroupMember, removeGroupMember, getGroupMembers
+} from './controllers/group.controller';
 import mediaRoutes from './routes/mediaRoutes';
-import { createGroup, getMyGroups, addGroupMember, removeGroupMember, getGroupMembers } from './controllers/group.controller';
 
 const prisma = new PrismaClient();
 
-// ✅ Страховка: одна необработанная ошибка в сокет-хендлере не должна ронять
-// весь процесс (Node 22 по умолчанию умирает на unhandledRejection).
+// ✅ Страховка: одна необработанная ошибка в сокет-хендлере не должна ронять процесс
 process.on('unhandledRejection', (reason) => {
   console.error('⚠️ Unhandled rejection:', reason);
 });
@@ -28,8 +32,8 @@ process.on('uncaughtException', (err) => {
   console.error('⚠️ Uncaught exception:', err);
 });
 
-// === СОСТОЯНИЕ СОКЕТОВ (в памяти — только маппинги, сообщения теперь в БД) ===
-// userId -> Set<socketId>: поддержка нескольких устройств одного пользователя
+// === СОСТОЯНИЕ СОКЕТОВ ===
+// userId -> Set<socketId>; deviceId каждого сокета — в socket.data.deviceId
 const userSockets = new Map<string, Set<string>>();
 const socketUsers = new Map<string, string>();
 
@@ -53,7 +57,7 @@ const removeSocket = (socketId: string): string | null => {
     set.delete(socketId);
     if (set.size === 0) {
       userSockets.delete(userId);
-      return userId; // последний сокет отвалился
+      return userId;
     }
   }
   return null;
@@ -63,6 +67,18 @@ const emitToUser = (io: Server, userId: string, event: string, data: any) => {
   const set = userSockets.get(userId);
   if (!set) return;
   for (const sid of set) io.to(sid).emit(event, data);
+};
+
+// 🌟 Мульти-девайс: отправка конкретному устройству пользователя
+const emitToUserDevice = (io: Server, userId: string, deviceId: string, event: string, data: any) => {
+  const set = userSockets.get(userId);
+  if (!set) return;
+  for (const sid of set) {
+    const s = io.sockets.sockets.get(sid);
+    if (s && (s.data.deviceId || '1') === deviceId) {
+      s.emit(event, data);
+    }
+  }
 };
 
 // Простой in-memory rate limiter для auth-эндпоинтов
@@ -88,7 +104,7 @@ export const startServer = (port: number) => {
 
   app.use(helmet());
   app.use(cors(corsOptions));
-  app.use(express.json({ limit: '2mb' })); // 50mb для JSON не нужно, медиа идёт через multipart
+  app.use(express.json({ limit: '2mb' }));
 
   // === API ROUTES ===
   app.get('/api/health', (req, res) => {
@@ -107,7 +123,6 @@ export const startServer = (port: number) => {
     next();
   }, login);
 
-  // Всё ниже — только с валидным JWT. userId больше НЕ принимаем от клиента.
   app.get('/api/users/search', authenticate, searchUsers);
   app.get('/api/myprofile', authenticate, getMyProfile);
   app.put('/api/myprofile', authenticate, updateMyProfile);
@@ -120,13 +135,16 @@ export const startServer = (port: number) => {
   app.get('/api/friends-requests/count', authenticate, getPendingCountRequests);
   app.post('/api/friend-requests/respond', authenticate, respondToFriendRequest);
 
+  // === КЛЮЧИ (мульти-девайс) ===
   app.post('/api/keys/upload', authenticate, uploadKeys);
-  app.get('/api/keys/:userId', authenticate, getKeysBundle);
   app.get('/api/keys/count/remaining', authenticate, getRemainingPreKeys);
+  app.post('/api/keys/one-time', authenticate, uploadOneTimeKeys);
+  app.get('/api/keys/:userId/identity', authenticate, getIdentityKey);
+  // Бандлы всех устройств пользователя (НОВЫЙ формат ответа: {devices:[...]})
+  app.get('/api/keys/:userId', authenticate, getDevicesBundle);
 
   app.post('/api/devices/register', authenticate, registerDevice);
   app.delete('/api/devices/:deviceId', authenticate, unregisterDevice);
-  app.get('/api/keys/:userId/identity', authenticate, getIdentityKey);
 
   // === ГРУППОВЫЕ ЧАТЫ ===
   app.post('/api/groups', authenticate, createGroup);
@@ -159,7 +177,6 @@ export const startServer = (port: number) => {
     const fs = require('fs');
     const path = require('path');
     const { version } = req.params;
-    // Версия — просто имя файла, валидируем чтобы не было traversal
     if (!/^[a-zA-Z0-9._-]+$/.test(version)) {
       return res.status(400).json({ error: 'Invalid version' });
     }
@@ -173,13 +190,11 @@ export const startServer = (port: number) => {
     res.sendFile(filePath);
   });
 
-  // Список чатов текущего пользователя: прямые собеседники + мои группы
-  // (для глобального догона сообщений на клиенте)
+  // Список чатов: прямые собеседники + мои группы (для глобального догона)
   app.get('/api/chats', authenticate, async (req: AuthRequest, res) => {
     try {
       const me = req.user!.id;
 
-      // Прямые чаты
       const rows = await prisma.message.findMany({
         where: {
           OR: [
@@ -194,7 +209,6 @@ export const startServer = (port: number) => {
         .map(r => r.chatKey.split(':').find(p => p !== me))
         .filter((p): p is string => !!p);
 
-      // Группы, где я состою и где есть сообщения
       const myGroups = await prisma.groupMember.findMany({
         where: { userId: me },
         select: { groupId: true }
@@ -216,7 +230,6 @@ export const startServer = (port: number) => {
   });
 
   // История сообщений чата. chatId = id собеседника ИЛИ id группы.
-  // Авторизация: личный чат — requester участник пары; группа — проверка membership.
   app.get('/api/chats/:chatId/messages', authenticate, async (req: AuthRequest, res) => {
     try {
       const me = req.user!.id;
@@ -226,11 +239,7 @@ export const startServer = (port: number) => {
         return res.status(400).json({ error: 'Invalid since' });
       }
 
-      // groupId → история группы; иначе — личный чат
-      const isGroup = await prisma.group.findUnique({
-        where: { id: peerId },
-        select: { id: true }
-      });
+      const isGroup = await prisma.group.findUnique({ where: { id: peerId }, select: { id: true } });
       const chatKey = isGroup ? `group:${peerId}` : getChatKey(me, peerId);
       if (isGroup) {
         const isMember = await prisma.groupMember.findUnique({
@@ -240,10 +249,7 @@ export const startServer = (port: number) => {
       }
 
       const messages = await prisma.message.findMany({
-        where: {
-          chatKey,
-          ...(since ? { timestamp: { gt: new Date(since) } } : {})
-        },
+        where: { chatKey, ...(since ? { timestamp: { gt: new Date(since) } } : {}) },
         orderBy: { timestamp: 'asc' },
         take: 500
       });
@@ -269,6 +275,16 @@ export const startServer = (port: number) => {
   // === SOCKET.IO ===
   const io = new Server(server, { cors: corsOptions });
 
+  // Личность из JWT + deviceId из handshake (для мульти-девайс доставки)
+  io.use((socket, next) => {
+    const token = socket.handshake.auth?.token;
+    const decoded = token ? verifyToken(token) : null;
+    if (!decoded) return next(new Error('unauthorized'));
+    socket.data.userId = decoded.id;
+    socket.data.deviceId = String(socket.handshake.auth?.deviceId || '1');
+    next();
+  });
+
   // Маршрутизация групповых событий из контроллеров (системные сообщения)
   app.set('groupEmit', (groupId: string, event: string, data: any) => {
     prisma.groupMember.findMany({ where: { groupId }, select: { userId: true } })
@@ -276,19 +292,10 @@ export const startServer = (port: number) => {
       .catch(console.error);
   });
 
-  // ⚠️ ВАЖНО: middleware регистрируется ЗДЕСЬ, до io.on('connection').
-  // В предыдущей версии io.use был внутри connection и НЕ защищал подключения.
-  io.use((socket, next) => {
-    const token = socket.handshake.auth?.token;
-    const decoded = token ? verifyToken(token) : null;
-    if (!decoded) return next(new Error('unauthorized'));
-    socket.data.userId = decoded.id;
-    next();
-  });
-
   io.on('connection', (socket: Socket) => {
     const myUserId = socket.data.userId as string;
-    console.log(`🔗 Client connected: ${socket.id} (user ${myUserId})`);
+    const myDeviceId = (socket.data.deviceId as string) || '1';
+    console.log(`🔗 Client connected: ${socket.id} (user ${myUserId}, device ${myDeviceId})`);
 
     const wasOffline = !userSockets.has(myUserId);
     addSocket(myUserId, socket.id);
@@ -297,7 +304,7 @@ export const startServer = (port: number) => {
       socket.broadcast.emit('user_status', { userId: myUserId, isOnline: true, timestamp: Date.now() });
     }
 
-    // Догоняем недоставленные сообщения из БД
+    // Догон недоставленных сообщений из БД
     prisma.message.findMany({
       where: {
         deliveredAt: null,
@@ -311,9 +318,25 @@ export const startServer = (port: number) => {
       take: 200
     }).then(async (pending) => {
       for (const m of pending) {
+        // Мульти-девайс: отдаём только entry для ЭТОГО устройства
+        let entry: any = null;
+        let fromDeviceId = '1';
+        const p: any = m.payload;
+        if (p && Array.isArray(p.payloads)) {
+          fromDeviceId = p.fromDeviceId || '1';
+          const isGroupPayload = p.payloads.length > 0 && p.payloads[0].userId !== undefined;
+          entry = isGroupPayload
+            ? p.payloads.find((x: any) => x.userId === myUserId && x.deviceId === myDeviceId)
+            : p.payloads.find((x: any) => x.deviceId === myDeviceId);
+        } else if (p && p.type !== undefined) {
+          entry = p; // легаси single-device
+        }
+        if (!entry) continue;
+
         socket.emit('private_message', {
           from: m.senderId,
-          payload: m.payload,
+          fromDeviceId,
+          payload: { type: entry.type, data: entry.data },
           messageId: m.id,
           timestamp: m.timestamp.getTime(),
           isOffline: true
@@ -328,15 +351,22 @@ export const startServer = (port: number) => {
       }
     }).catch(console.error);
 
-    // join_room больше не принимает userId — личность из JWT (socket.data.userId)
     socket.on('join_room', () => {
-      console.log(`👤 User ${myUserId} joined with socket ${socket.id}`);
+      console.log(`👤 User ${myUserId} (device ${myDeviceId}) joined`);
     });
 
+    // === ЛИЧНЫЕ СООБЩЕНИЯ (мульти-девайс) ===
+    // Клиент присылает payloads: [{deviceId, type, data}] — по entry на каждое
+    // устройство получателя. Легаси-формат {type,data} тоже принимается.
     socket.on('private_message', async (data) => {
-      const from = socket.data.userId as string; // только из токена
-      const { to, payload, messageId, typeMsg } = data || {};
-      if (!from || !to || !payload || !messageId) return;
+      const from = socket.data.userId as string;
+      const { to, payloads, payload, messageId, typeMsg } = data || {};
+      if (!from || !to || !messageId) return;
+      if (!payloads && !payload) return;
+
+      const normPayloads: any[] = Array.isArray(payloads)
+        ? payloads
+        : [{ deviceId: '1', type: payload.type, data: payload.data }];
 
       try {
         const receiver = await prisma.user.findUnique({ where: { id: to }, select: { id: true } });
@@ -345,23 +375,21 @@ export const startServer = (port: number) => {
         const chatKey = getChatKey(from, to);
         const ts = Date.now();
 
-        // БД — источник истины. payload уже зашифрован клиентом (E2E).
-        // ⚠️ Дедупликация: клиент ретраит отправку при обрыве → тот же messageId.
-        //    upsert(update:{}) на MySQL бросает P2002 (конфликт PRIMARY) — процесс падал,
-        //    поэтому явный find → create.
         const existing = await prisma.message.findUnique({ where: { id: messageId } });
         if (existing) {
-          // Повторная отправка того же сообщения: догоняем доставку, не дублируя в БД
-          if (userSockets.has(to)) {
-            emitToUser(io, to, 'private_message', { from, payload, messageId, timestamp: ts });
-          } else {
-            sendSilentMessagePush(to, from, messageId, payload, existing.typeMsg ?? 'text');
+          // Повторная отправка: догоняем доставку недоставленным устройствам
+          const p: any = existing.payload;
+          const list: any[] = p?.payloads ?? [];
+          for (const sid of userSockets.get(to) ?? []) {
+            const s = io.sockets.sockets.get(sid);
+            const dev = (s?.data.deviceId as string) || '1';
+            const entry = list.find((x: any) => x.deviceId === dev);
+            if (entry && s) {
+              s.emit('private_message', { from, fromDeviceId: p?.fromDeviceId || '1', payload: { type: entry.type, data: entry.data }, messageId, timestamp: ts });
+            }
           }
           if (!existing.deliveredAt) {
-            await prisma.message.update({
-              where: { id: messageId },
-              data: { deliveredAt: new Date() }
-            }).catch(() => {});
+            await prisma.message.update({ where: { id: messageId }, data: { deliveredAt: new Date() } }).catch(() => {});
           }
           return;
         }
@@ -372,65 +400,7 @@ export const startServer = (port: number) => {
               id: messageId,
               chatKey,
               senderId: from,
-              payload,
-              typeMsg: typeof typeMsg === 'string' ? typeMsg : 'text',
-              timestamp: new Date(ts)
-            }
-          });
-        } catch (e: any) {
-          if (e?.code === 'P2002') return; // гонка двух одинаковых messageId — дубликат игнорим
-          throw e;
-        }
-
-        if (userSockets.has(to)) {
-          emitToUser(io, to, 'private_message', { from, payload, messageId, timestamp: ts });
-          // deliveredAt — best effort на emit; если пакет потерян, сообщение
-          // всё равно останется в БД и придёт через history/offline-догон
-          prisma.message.update({
-            where: { id: messageId },
-            data: { deliveredAt: new Date() }
-          }).catch(() => {});
-        } else {
-          sendSilentMessagePush(to, from, messageId, payload, typeMsg ?? 'text');
-        }
-      } catch (e) {
-        console.error('private_message error:', e);
-      }
-    });
-
-    // === ГРУППОВЫЕ СООБЩЕНИЯ (вариант А: pairwise-шифрование на клиенте) ===
-    // Клиент присылает payloads: [{userId, type, data}] — зашифровано для КАЖДОГО
-    // участника отдельно. Сервер хранит всё и раздаёт каждому его entry.
-    socket.on('group_message', async (data) => {
-      const from = socket.data.userId as string;
-      const { groupId, payloads, messageId, typeMsg } = data || {};
-      if (!from || !groupId || !Array.isArray(payloads) || !messageId) return;
-
-      try {
-        // Отправитель должен быть участником
-        const membership = await prisma.groupMember.findUnique({
-          where: { groupId_userId: { groupId, userId: from } }
-        });
-        if (!membership) return;
-
-        const members = await prisma.groupMember.findMany({
-          where: { groupId, userId: { not: from } },
-          select: { userId: true }
-        });
-        const recipientIds = members.map(m => m.userId);
-        const chatKey = `group:${groupId}`;
-        const ts = Date.now();
-
-        // Дедупликация (ретраи клиента)
-        const existing = await prisma.message.findUnique({ where: { id: messageId } });
-        if (existing) return;
-        try {
-          await prisma.message.create({
-            data: {
-              id: messageId,
-              chatKey,
-              senderId: from,
-              payload: { payloads },
+              payload: { fromDeviceId: myDeviceId, payloads: normPayloads },
               typeMsg: typeof typeMsg === 'string' ? typeMsg : 'text',
               timestamp: new Date(ts)
             }
@@ -440,29 +410,158 @@ export const startServer = (port: number) => {
           throw e;
         }
 
-        // Маршрутизация: каждому получателю — его собственный зашифрованный entry
-        const payloadMap = new Map<string, { type: number; data: string }>(
-          payloads.map((p: any) => [p.userId, { type: p.type, data: p.data }])
-        );
+        // Доставка: каждому онлайн-сокету — entry его устройства
+        const set = userSockets.get(to);
+        let deliveredAny = false;
+        if (set) {
+          for (const sid of set) {
+            const s = io.sockets.sockets.get(sid);
+            const dev = (s?.data.deviceId as string) || '1';
+            const entry = normPayloads.find((x: any) => x.deviceId === dev);
+            if (entry && s) {
+              s.emit('private_message', {
+                from, fromDeviceId: myDeviceId,
+                payload: { type: entry.type, data: entry.data },
+                messageId, timestamp: ts
+              });
+              deliveredAny = true;
+            }
+          }
+        }
+        if (deliveredAny) {
+          prisma.message.update({ where: { id: messageId }, data: { deliveredAt: new Date() } }).catch(() => {});
+        } else {
+          sendSilentMessagePush(to, from, messageId, normPayloads[0], typeMsg ?? 'text');
+        }
+      } catch (e) {
+        console.error('private_message error:', e);
+      }
+    });
 
-        for (const uid of recipientIds) {
-          const entry = payloadMap.get(uid);
-          if (!entry) continue; // отправитель не зашифровал для этого участника — пропуск
+    // === ГРУППОВЫЕ СООБЩЕНИЯ (мульти-девайс) ===
+    // payloads: [{userId, deviceId, type, data}]
+    socket.on('group_message', async (data) => {
+      const from = socket.data.userId as string;
+      const { groupId, payloads, messageId, typeMsg } = data || {};
+      if (!from || !groupId || !Array.isArray(payloads) || !messageId) return;
 
-          if (userSockets.has(uid)) {
-            emitToUser(io, uid, 'group_message', {
-              groupId, from,
-              payload: entry,
-              messageId, timestamp: ts
-            });
-          } else {
-            sendSilentMessagePush(uid, from, messageId, entry, typeMsg ?? 'text');
+      try {
+        const membership = await prisma.groupMember.findUnique({
+          where: { groupId_userId: { groupId, userId: from } }
+        });
+        if (!membership) return;
+
+        const members = await prisma.groupMember.findMany({
+          where: { groupId, userId: { not: from } },
+          select: { userId: true }
+        });
+        const chatKey = `group:${groupId}`;
+        const ts = Date.now();
+
+        const existing = await prisma.message.findUnique({ where: { id: messageId } });
+        if (existing) return;
+        try {
+          await prisma.message.create({
+            data: {
+              id: messageId,
+              chatKey,
+              senderId: from,
+              payload: { fromDeviceId: myDeviceId, payloads },
+              typeMsg: typeof typeMsg === 'string' ? typeMsg : 'text',
+              timestamp: new Date(ts)
+            }
+          });
+        } catch (e: any) {
+          if (e?.code === 'P2002') return;
+          throw e;
+        }
+
+        for (const uid of members.map(m => m.userId)) {
+          const set = userSockets.get(uid);
+          if (!set) {
+            // Оффлайн-пуш (первый entry как «намёк»)
+            const anyEntry = payloads.find((x: any) => x.userId === uid);
+            if (anyEntry) sendSilentMessagePush(uid, from, messageId, { type: anyEntry.type, data: anyEntry.data }, typeMsg ?? 'text');
+            continue;
+          }
+          for (const sid of set) {
+            const s = io.sockets.sockets.get(sid);
+            const dev = (s?.data.deviceId as string) || '1';
+            const entry = payloads.find((x: any) => x.userId === uid && x.deviceId === dev);
+            if (entry && s) {
+              s.emit('group_message', {
+                groupId, from, fromDeviceId: myDeviceId,
+                payload: { type: entry.type, data: entry.data },
+                messageId, timestamp: ts
+              });
+            }
           }
         }
       } catch (e) {
         console.error('group_message error:', e);
       }
     });
+
+    // === ДЕЙСТВИЯ С СООБЩЕНИЯМИ (edit/delete) — тоже мульти-девайс ===
+    // payloads: [{deviceId, type, data}]; легаси {type,data} принимается
+    socket.on('message_action', (data) => {
+      const from = socket.data.userId as string;
+      if (!from) return;
+      const { chatId, payloads, payload, messageId } = data || {};
+      if (!chatId) return;
+
+      const normPayloads: any[] = Array.isArray(payloads)
+        ? payloads
+        : [{ deviceId: '1', type: payload.type, data: payload.data }];
+
+      const set = userSockets.get(chatId);
+      if (set) {
+        for (const sid of set) {
+          const s = io.sockets.sockets.get(sid);
+          const dev = (s?.data.deviceId as string) || '1';
+          const entry = normPayloads.find((x: any) => x.deviceId === dev);
+          if (entry && s) {
+            s.emit('message_action', {
+              from, fromDeviceId: myDeviceId,
+              payload: { type: entry.type, data: entry.data },
+              messageId, timestamp: Date.now()
+            });
+          }
+        }
+      }
+    });
+
+    socket.on('delivery_receipt', (data) => {
+      const userId = socket.data.userId as string;
+      if (!userId) return;
+      const { messageId, chatId } = data || {};
+
+      prisma.message.updateMany({ where: { id: messageId }, data: { deliveredAt: new Date() } }).catch(() => {});
+
+      emitToUser(io, chatId, 'message_delivered', { messageId, deliveredBy: userId, timestamp: Date.now() });
+    });
+
+    socket.on('read_receipt', (data) => {
+      const userId = socket.data.userId as string;
+      if (!userId) return;
+      const { messageId, chatId } = data || {};
+
+      if (!readReceipts.has(messageId)) {
+        readReceipts.set(messageId, { readBy: [], timestamp: Date.now() });
+      }
+      const receipt = readReceipts.get(messageId)!;
+      if (!receipt.readBy.includes(userId)) receipt.readBy.push(userId);
+
+      emitToUser(io, chatId, 'message_read', { messageId, readBy: userId, timestamp: Date.now() });
+    });
+
+    const handleTyping = (chatId: string, isTyping: boolean) => {
+      const userId = socket.data.userId as string;
+      if (!userId || !chatId) return;
+      emitToUser(io, chatId, 'user_typing', { userId, chatId, isTyping, timestamp: Date.now() });
+    };
+    socket.on('typing_start', (d) => handleTyping(d?.chatId, true));
+    socket.on('typing_stop', (d) => handleTyping(d?.chatId, false));
 
     // Тайпинг в группах: ретрансляция остальным участникам
     socket.on('group_typing', async (data) => {
@@ -489,58 +588,6 @@ export const startServer = (port: number) => {
       }
     });
 
-    socket.on('message_action', (data) => {
-      const from = socket.data.userId as string;
-      if (!from) return;
-      const { chatId, payload, messageId } = data || {};
-
-      // chatId = id собеседника: шлём только ему
-      emitToUser(io, chatId, 'message_action', {
-        from, payload, messageId, timestamp: Date.now()
-      });
-    });
-
-    socket.on('delivery_receipt', (data) => {
-      const userId = socket.data.userId as string;
-      if (!userId) return;
-      const { messageId, chatId } = data || {};
-
-      prisma.message.updateMany({
-        where: { id: messageId },
-        data: { deliveredAt: new Date() }
-      }).catch(() => {});
-
-      emitToUser(io, chatId, 'message_delivered', {
-        messageId, deliveredBy: userId, timestamp: Date.now()
-      });
-    });
-
-    socket.on('read_receipt', (data) => {
-      const userId = socket.data.userId as string;
-      if (!userId) return;
-      const { messageId, chatId } = data || {};
-
-      if (!readReceipts.has(messageId)) {
-        readReceipts.set(messageId, { readBy: [], timestamp: Date.now() });
-      }
-      const receipt = readReceipts.get(messageId)!;
-      if (!receipt.readBy.includes(userId)) receipt.readBy.push(userId);
-
-      emitToUser(io, chatId, 'message_read', {
-        messageId, readBy: userId, timestamp: Date.now()
-      });
-    });
-
-    const handleTyping = (chatId: string, isTyping: boolean) => {
-      const userId = socket.data.userId as string;
-      if (!userId || !chatId) return;
-      emitToUser(io, chatId, 'user_typing', {
-        userId, chatId, isTyping, timestamp: Date.now()
-      });
-    };
-    socket.on('typing_start', (d) => handleTyping(d?.chatId, true));
-    socket.on('typing_stop', (d) => handleTyping(d?.chatId, false));
-
     socket.on('disconnect', () => {
       const fullyOffline = removeSocket(socket.id);
       if (fullyOffline) {
@@ -551,6 +598,28 @@ export const startServer = (port: number) => {
       }
     });
   });
+
+  // ✅ ШАГ 1: Отдаем статические файлы (CSS, JS, картинки) из папки сборки
+const webDistPath = path.join(__dirname, '../web/dist');
+app.use(express.static(webDistPath));
+
+// ✅ ШАГ 2: BULLETPROOF SPA FALLBACK (Обходит проблему с path-to-regexp)
+// Мы используем app.use БЕЗ указания пути, чтобы перехватить всё, 
+// что не было обработано предыдущими роутами (API или статикой)
+app.use((req, res, next) => {
+  // Если запрос идет к API или сокетам, пропускаем его (хотя они уже должны были обработаться)
+  if (req.path.startsWith('/api/') || req.path.startsWith('/socket.io/')) {
+    return next();
+  }
+  
+  // Для всех остальных запросов (например, /, /chats, /profile) отдаем index.html
+  res.sendFile(path.join(webDistPath, 'index.html'), (err) => {
+    if (err) {
+      console.error('❌ Ошибка при отдаче index.html:', err);
+      res.status(500).send('Ошибка загрузки приложения. Попробуйте обновить страницу.');
+    }
+  });
+});
 
   server.listen(port, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${port}`);
