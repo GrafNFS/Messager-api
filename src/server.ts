@@ -41,6 +41,17 @@ const readReceipts = new Map<string, { readBy: string[]; timestamp: number }>();
 
 const getChatKey = (id1: string, id2: string): string => [id1, id2].sort().join(':');
 
+// 🌟 Signal Protocol требует int deviceId (1..16383); строковые id (web-xxx) хэшируем
+const deviceIdToInt = (deviceId: string): number => {
+  const n = parseInt(deviceId, 10);
+  if (!isNaN(n)) return n;
+  let hash = 0;
+  for (let i = 0; i < deviceId.length; i++) {
+    hash = ((hash << 5) - hash + deviceId.charCodeAt(i)) | 0;
+  }
+  return (Math.abs(hash) % 16383) + 1;
+};
+
 const addSocket = (userId: string, socketId: string) => {
   if (!userSockets.has(userId)) userSockets.set(userId, new Set());
   userSockets.get(userId)!.add(socketId);
@@ -325,9 +336,10 @@ export const startServer = (port: number) => {
         if (p && Array.isArray(p.payloads)) {
           fromDeviceId = p.fromDeviceId || '1';
           const isGroupPayload = p.payloads.length > 0 && p.payloads[0].userId !== undefined;
+          const myDeviceInt = deviceIdToInt(myDeviceId);
           entry = isGroupPayload
-            ? p.payloads.find((x: any) => x.userId === myUserId && x.deviceId === myDeviceId)
-            : p.payloads.find((x: any) => x.deviceId === myDeviceId);
+            ? p.payloads.find((x: any) => x.userId === myUserId && x.deviceId === myDeviceInt)
+            : p.payloads.find((x: any) => x.deviceId === myDeviceInt);
         } else if (p && p.type !== undefined) {
           entry = p; // легаси single-device
         }
@@ -382,7 +394,7 @@ export const startServer = (port: number) => {
           const list: any[] = p?.payloads ?? [];
           for (const sid of userSockets.get(to) ?? []) {
             const s = io.sockets.sockets.get(sid);
-            const dev = (s?.data.deviceId as string) || '1';
+            const dev = deviceIdToInt((s?.data.deviceId as string) || '1'); 
             const entry = list.find((x: any) => x.deviceId === dev);
             if (entry && s) {
               s.emit('private_message', { from, fromDeviceId: p?.fromDeviceId || '1', payload: { type: entry.type, data: entry.data }, messageId, timestamp: ts });
@@ -416,7 +428,7 @@ export const startServer = (port: number) => {
         if (set) {
           for (const sid of set) {
             const s = io.sockets.sockets.get(sid);
-            const dev = (s?.data.deviceId as string) || '1';
+            const dev = deviceIdToInt((s?.data.deviceId as string) || '1'); 
             const entry = normPayloads.find((x: any) => x.deviceId === dev);
             if (entry && s) {
               s.emit('private_message', {
@@ -486,7 +498,7 @@ export const startServer = (port: number) => {
           }
           for (const sid of set) {
             const s = io.sockets.sockets.get(sid);
-            const dev = (s?.data.deviceId as string) || '1';
+            const dev = deviceIdToInt((s?.data.deviceId as string) || '1'); 
             const entry = payloads.find((x: any) => x.userId === uid && x.deviceId === dev);
             if (entry && s) {
               s.emit('group_message', {
@@ -518,7 +530,7 @@ export const startServer = (port: number) => {
       if (set) {
         for (const sid of set) {
           const s = io.sockets.sockets.get(sid);
-          const dev = (s?.data.deviceId as string) || '1';
+          const dev = deviceIdToInt((s?.data.deviceId as string) || '1'); 
           const entry = normPayloads.find((x: any) => x.deviceId === dev);
           if (entry && s) {
             s.emit('message_action', {

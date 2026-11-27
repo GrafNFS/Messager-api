@@ -56,7 +56,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
         deviceId: bundle.deviceId,
         identityKey: bundle.identityKey,
         signedPreKeyId: 1,
-        signedPreKeyPublic: bundle.publicKey,
+        signedPreKeyPublic: bundle.signedPreKeyPublic,
         signedPreKeySig: fakeSignatureB64, // ✅ Теперь непустое значение
         oneTimeKeys: [],
         registrationId: bundle.registrationId, // ✅ Уже число из WebCryptoManager
@@ -118,9 +118,10 @@ export function SocketProvider({ children }: { children: ReactNode }) {
           return;
         }
         const text = await manager.decrypt(
-          data.fromPublicKey || '',
-          iv,
-          ciphertext
+            data.from,
+            data.fromDeviceId || 1,
+            data.payload.type,
+            data.payload.data
         );
         setMessages(prev => [...prev, {
           from: data.from,
@@ -146,18 +147,19 @@ export function SocketProvider({ children }: { children: ReactNode }) {
   const sendMessage = useCallback(async (to: string, toPublicKey: string, text: string) => {
     if (!crypto || !socket?.connected) return false;
     try {
-      const encrypted = await crypto.encrypt(toPublicKey, text);
-      const messageId = crypto.randomUUID();
-      socket.emit('private_message', {
-        to,
-        payloads: [{
-          deviceId: '1',
-          type: 'encrypted',
-          data: encrypted,
-        }],
-        messageId,
-        typeMsg: 'text',
-      });
+      const devicesResp = await fetch(`/api/keys/${toUserId}`, {
+  headers: { Authorization: `Bearer ${token}` }
+});
+const { devices } = await devicesResp.json();
+
+// Шифруем для каждого устройства
+const payloads = await Promise.all(devices.map(async (d: DeviceKeysBundle) => {
+  const enc = await crypto.encrypt(toUserId, crypto.deviceIdToInt(d.deviceId), d, text);
+  return { deviceId: crypto.deviceIdToInt(d.deviceId), type: enc.type, data: enc.data };
+}));
+
+const messageId = globalThis.crypto.randomUUID();  // не crypto.randomUUID()
+socket.emit('private_message', { to: toUserId, messageId, typeMsg: 'text', payloads });
       return true;
     } catch (e) {
       console.error('Send failed:', e);
